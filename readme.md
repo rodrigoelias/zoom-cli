@@ -4,6 +4,10 @@
 
 A command-line tool for managing Zoom meetings. It talks directly to Zoom's internal web API using your browser session cookies — no OAuth app or API keys needed.
 
+## Windows
+
+Waiting for your PR 😉
+
 ## Prerequisites
 
 - **bash** (macOS/Linux)
