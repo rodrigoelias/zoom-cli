@@ -1,0 +1,115 @@
+{
+  "scheduleFor": {"value": "jecAwj1pTU2SYC5j84Atkg"},
+  "topic": {"value": "My Meeting"},
+  "agenda": {"value": ""},
+  "startDate": {"value": null},
+  "startTime": {"value": "10:00"},
+  "startTime2": {"value": "AM"},
+  "duration": {"value": 60},
+  "timezone": {"value": "Europe/London"},
+  "recurring": {
+    "value": null,
+    "childParams": {
+      "meetingEventEnabled": {"show": true, "value": true, "disabled": false, "childParams": null, "dataOptions": null},
+      "recurring": {
+        "show": true,
+        "value": {
+          "meetingNumber": 0,
+          "type": "DAILY",
+          "endType": null,
+          "timezone": null,
+          "startTime": null,
+          "endTime": null,
+          "times": 7,
+          "currentUserId": null,
+          "eventId": null,
+          "recurrenceValues": [{"type": "INTERVAL", "value": "1", "duration": null}],
+          "skipBackward": false
+        },
+        "disabled": false, "childParams": null, "dataOptions": null
+      },
+      "maxRecurrences": {"show": true, "value": {"maxDaily": 365, "maxWeekly": 110, "maxMonthly": 60}, "disabled": false, "childParams": null, "dataOptions": null},
+      "canScheduleNoEndType": {"show": true, "value": true, "disabled": false, "childParams": null, "dataOptions": null}
+    }
+  },
+  "recurringType": {"value": "DAILY"},
+  "recurringRepeat": {"value": "1"},
+  "recurringOccurs": {"value": ""},
+  "recurringEndDate": {"value": {"type": null, "activeDate": null, "activedescendant": "7", "activeDateTimestamp": null}},
+  "publicEventList": {"value": null},
+  "pmc": {
+    "value": true,
+    "childParams": {
+      "withPMISupportCMC": {"show": true, "value": true, "disabled": false, "childParams": null, "dataOptions": null},
+      "regSupportCMC": {"show": true, "value": true, "disabled": false, "childParams": null, "dataOptions": null},
+      "enableJBHPMISupportCMC": {"show": true, "value": false, "disabled": false, "childParams": null, "dataOptions": null},
+      "designateCMCToChannel": {"show": false, "value": null, "disabled": false, "childParams": null, "dataOptions": null}
+    }
+  },
+  "invitee": {
+    "value": [],
+    "childParams": {
+      "supportDigitalTeammate": {"show": true, "value": false, "disabled": false, "childParams": null, "dataOptions": null},
+      "smsCountryList": {"show": true, "value": [], "disabled": false, "childParams": null, "dataOptions": null},
+      "limit": {"show": true, "value": 1000, "disabled": false, "childParams": null, "dataOptions": null},
+      "supportSMSInvitation": {"show": true, "value": false, "disabled": false, "childParams": null, "dataOptions": null},
+      "supportExpandChannel": {"show": true, "value": false, "disabled": false, "childParams": null, "dataOptions": null},
+      "switcher": {"show": true, "value": true, "disabled": false, "childParams": null, "dataOptions": null},
+      "supportSubsetChannel": {"show": true, "value": true, "disabled": false, "childParams": null, "dataOptions": null},
+      "channel": {"value": []},
+      "digitalTeammate": {"value": []}
+    }
+  },
+  "registration": {"value": null, "childParams": {"registrationRequireType": {"show": true, "value": "1", "disabled": false, "childParams": null, "dataOptions": null}}},
+  "meetingId": {"value": false, "childParams": {"pmiNumber": {"show": true, "value": 9546020623, "disabled": false, "childParams": null, "dataOptions": null}}},
+  "template": {"value": null, "childParams": {"adminTemplateOn": {"show": true, "value": false}, "enableAdminTemplate": {"show": true, "value": true}}},
+  "passcode": {
+    "value": false,
+    "childParams": {
+      "meetingNoPasscode": {"show": false, "value": true, "disabled": false, "childParams": null, "dataOptions": null},
+      "meetingPasscode": {"show": true, "value": "783948", "disabled": false, "childParams": null, "dataOptions": null},
+      "meetingPasscodeRule": {"show": true, "value": {}, "disabled": false, "childParams": null, "dataOptions": null},
+      "meetingNewSecurity": {"show": true, "value": false, "disabled": false, "childParams": null, "dataOptions": null},
+      "meetingPasscodeEmbed": {"show": true, "value": true, "disabled": false, "childParams": null, "dataOptions": null}
+    }
+  },
+  "waitingRoom": {"value": false},
+  "waitingRoom2": {"value": null},
+  "enforceSignedIn": {
+    "value": true,
+    "childParams": {
+      "meetingAuthGuest": {"show": true, "value": null, "disabled": false, "childParams": null, "dataOptions": null},
+      "meetingAuthSelectedOption": {"show": true, "value": {"id": "signIn_nRGOKeD3QMGyXqd2xbuulw", "label": "Signed-in Skyscanner Zoom users", "type": "3"}, "disabled": false, "childParams": null, "dataOptions": null}
+    }
+  },
+  "encryption": {"value": null},
+  "videoHost": {"value": true},
+  "videoParticipant": {"value": true},
+  "audio": {"value": "both"},
+  "jbh": {"value": true},
+  "muteUponEntry": {"value": false},
+  "waterMark": {"value": false, "childParams": {"enableWatermarkSkipAuthCheck": {"show": true, "value": false}}},
+  "audioWaterMark": {"value": null},
+  "breakoutRoom": {"value": null},
+  "requestUnmuteAll": {"value": null},
+  "autoRec": {"value": false, "childParams": {"autoRecordingSubSelected": {"show": true, "value": ""}, "exceedMaxStorage": {"show": true, "value": false}}},
+  "additionalDcs": {"value": false},
+  "meetingRegion": {"value": false},
+  "trackFields": {"value": []},
+  "alternativeHost": {"value": []},
+  "interpretation": {"value": false},
+  "videoOrder": {"value": false},
+  "focusMode": {"value": null},
+  "signInterpretation": {"value": null},
+  "qa": {"value": false},
+  "internalMeeting": {"value": null},
+  "meetingQuery": {"value": null},
+  "meetingSummary": {"value": null},
+  "attachment": {"value": null},
+  "moderateUnmute": {"value": null},
+  "meetingSummaryTemplate": {"value": null},
+  "smartAgenda": {"value": null},
+  "privateEvent": {"value": false},
+  "myNotesUseTranscript": {"value": null},
+  "frontParam": {"groupId": "", "targetUserId": null}
+}

@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Session / credentials (sensitive)
+.raw_cookies
+.raw_cookies.bak
+cookies.txt
+.csrf_token
+
+# API sniffing artifacts
+.api_calls.json
+.create_form_data.txt
+
+# Pi agent state
+.pi/
+
+# macOS
+.DS_Store
