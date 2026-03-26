@@ -1,3 +1,9 @@
+# zoom-cli
+
+> ⚠️ **Work in progress.** Only tested creating meetings (recurring, single, with invitees, etc). Everything else is experimental. Use at your own risk.
+
+---
+
 chmod +x zoom-cli.sh
 ./zoom-cli.sh refresh-csrf   # gets fresh CSRF token
 ./zoom-cli.sh list            # list meetings
