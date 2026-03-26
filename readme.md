@@ -123,4 +123,4 @@ All tests run offline with mocked HTTP — no Zoom account needed:
 
 ## License
 
-ISC
+MIT
