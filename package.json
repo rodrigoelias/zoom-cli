@@ -4,18 +4,9 @@
   "description": "Zoom meeting management CLI via Okta SSO",
   "type": "module",
   "scripts": {
-    "build": "tsc",
-    "dev": "ts-node src/index.ts",
     "capture-cookies": "ts-node scripts/grab-cookies.ts",
-    "auto-login": "ts-node scripts/auto-login.ts",
     "refresh-cookies": "ts-node scripts/refresh-cookies.ts",
-    "sniff-api": "ts-node scripts/sniff-api.ts",
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage",
-    "test:offline": "jest --testPathPattern=offline",
-    "test:e2e": "jest --testPathPattern=e2e",
-    "lint": "tsc --noEmit"
+    "test": "jest"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.16.0",
