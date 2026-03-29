@@ -1,18 +1,20 @@
-# Dependencies
 node_modules/
-
-# Session / credentials (sensitive)
-.raw_cookies
-.raw_cookies.bak
-cookies.txt
-.csrf_token
-
-# API sniffing artifacts
-.api_calls.json
-.create_form_data.txt
-
-# Pi agent state
-.pi/
-
-# macOS
+dist/
+*.log
 .DS_Store
+.env
+.env.local
+
+# Cookies & sensitive data
+.cookies/
+.raw_cookies
+cookies.txt
+/tmp/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Build
+.tsc/
+*.tsbuildinfo
