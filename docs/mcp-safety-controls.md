@@ -16,7 +16,7 @@ The zoom-cli tool manages Zoom meetings using session cookies from browser login
 
 ## 1. Command Allowlist
 
-**Principle**: Only safe, read-safe, or narrowly-scoped commands are exposed via MCP.
+**Principle**: Only safe, read-only commands are exposed via MCP in the initial release. Write operations are deferred to Phase 2+.
 
 ### Allowed Commands
 
@@ -24,9 +24,9 @@ The zoom-cli tool manages Zoom meetings using session cookies from browser login
 |---------|---|---------|-----------|
 | `list` / `ls` | ✓ Yes | List upcoming meetings (read-only) | Low |
 | `view` / `show` / `get` | ✓ Yes | View single meeting details (read-only) | Low |
-| `create` / `new` / `schedule` | ✓ Yes | Schedule new meeting (controlled args) | Medium |
-| `update` / `edit` | ✓ Yes | Update meeting details (controlled args) | Medium |
-| `delete` / `rm` / `remove` | ✓ Yes | Delete meeting (single ID validation) | Medium |
+| `create` / `new` / `schedule` | Deferred (Phase 2+) | Schedule new meeting (controlled args) | Medium |
+| `update` / `edit` | Deferred (Phase 2+) | Update meeting details (controlled args) | Medium |
+| `delete` / `rm` / `remove` | Deferred (Phase 2+) | Delete meeting (single ID validation) | Medium |
 
 ### Blocked Commands (Never Expose via MCP)
 
@@ -81,7 +81,7 @@ mcp-call "raw GET /meeting" && echo "FAIL: raw not blocked" || echo "PASS: raw b
   cmd_view "123456789012345678901" && echo "FAIL: oversized ID accepted" || echo "PASS"
   ```
 
-#### `create` / `new` / `schedule`
+#### `create` / `new` / `schedule` (deferred — included here for completeness when write tools are enabled)
 - **Validation**:
   - `--topic` / `-t`: Non-empty string, max 300 characters
   - `--date` / `-d`: MM/DD/YYYY format only
@@ -106,7 +106,7 @@ mcp-call "raw GET /meeting" && echo "FAIL: raw not blocked" || echo "PASS: raw b
   cmd_create --ampm "am" && echo "FAIL: case-sensitive ampm" || echo "PASS"
   ```
 
-#### `update` / `edit`
+#### `update` / `edit` (deferred — included here for completeness when write tools are enabled)
 - **Validation**:
   - Meeting ID: Same as `view` (numeric, 1-20 chars)
   - All optional parameters: Same validation as `create`
@@ -118,7 +118,7 @@ mcp-call "raw GET /meeting" && echo "FAIL: raw not blocked" || echo "PASS: raw b
   cmd_update "123456789" && echo "FAIL: no args" || echo "PASS"
   ```
 
-#### `delete` / `rm` / `remove`
+#### `delete` / `rm` / `remove` (deferred — included here for completeness when write tools are enabled)
 - **Validation**:
   - Meeting ID: Same as `view` (numeric, 1-20 chars)
 - **Testable Criterion**:
@@ -451,7 +451,7 @@ ZOOM_DEBUG=1 ./mcp-zoom-wrapper.sh view 999 2>&1 | grep -E "\[dbg\]|csrf_js resp
 ### 4. Logs Include Action Metadata But No Secrets
 
 ```bash
-# Create a meeting and check audit log
+# Create a meeting and check audit log (deferred — write commands not exposed until Phase 2+)
 ./mcp-zoom-wrapper.sh create --topic "Test" && \
   tail -1 .mcp-audit.log | grep -q "ACTION=create" && echo "PASS: logged" || echo "FAIL"
 
