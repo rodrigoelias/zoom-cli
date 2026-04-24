@@ -42,7 +42,7 @@ All API requests are made by shelling out to `curl`. JSON processing uses `pytho
 - `zoom_authed` wraps API calls with a single automatic retry after re-authentication. It does not retry infinitely.
 
 ### Non-interactive guard
-- `do_reauth` (lines 147-157) checks `[[ -t 0 && -t 1 ]]` before launching a browser. In non-interactive contexts (piped, cron, MCP server), it refuses to re-authenticate and returns an error instead of hanging.
+- `do_reauth` (lines 145-158) checks `[[ -t 0 && -t 1 ]]` before launching a browser. In non-interactive contexts (piped, cron, MCP server), it refuses to re-authenticate and returns an error instead of hanging.
 
 ### TLS for API traffic
 - All `ZOOM_BASE` URLs use `https://`. Curl follows redirects (`-L`) but still over HTTPS.
@@ -119,6 +119,8 @@ Cookies and CSRF tokens are passed as command-line arguments to `curl` (via `-H 
 **Risk: MEDIUM**
 
 Line 614 uses `eval "$(echo "$response" | python3 ...)"` to extract variables from the create-meeting response. The Python script uses `shlex.quote()` to sanitize values, which is correct. However, the pattern is fragile: a bug in the Python sanitization path or an unexpected response format could lead to shell injection.
+
+Note: if `python3` itself is compromised via PATH injection (see item 2), the `shlex.quote()` sanitization is irrelevant — the attacker controls the entire interpreter. The eval risk is therefore a subset of the PATH injection risk, but remains independently relevant if PATH is trusted but response content is attacker-controlled (e.g., via a compromised Zoom API response).
 
 ---
 
