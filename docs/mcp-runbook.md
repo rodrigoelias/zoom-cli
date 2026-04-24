@@ -53,11 +53,12 @@ This launches a Chromium window via Playwright (`grab-cookies.mjs`), waits for S
 
 ### MCP cold-start checklist
 
-1. Ensure `.raw_cookies` and `.csrf_token` exist in the zoom-cli directory.
-2. Start the MCP server process.
-3. Issue a `list` command as a smoke test. If it returns meetings (or "No upcoming meetings."), the session is live.
-
-Total time from cookie paste to working session: under 2 minutes.
+1. Start the MCP server process.
+2. On first use (or via an explicit `initialize_session` call), the MCP server launches a Chromium window through Playwright.
+3. The user completes SSO/MFA in the browser window.
+4. Cookies are captured and stored in process memory (never written to disk).
+5. The CSRF token is fetched automatically.
+6. Issue a `list` command as a smoke test. If it returns meetings (or "No upcoming meetings."), the session is live.
 
 ## Health checks
 
@@ -69,38 +70,31 @@ There is no dedicated health-check or `status` command. The recommended approach
 
 ### Suggested periodic check
 
-If operating zoom-cli as a long-running MCP server, run `list` on a schedule (e.g., every 30 minutes). If it fails with a session-expired error, credentials must be refreshed out-of-band.
+If operating zoom-cli as a long-running MCP server, run `list` on a schedule (e.g., every 30 minutes). Credentials are held in memory and used directly for each API call. If a check fails with a session-expired error, the server will attempt to re-launch the browser for re-authentication (requires an interactive display).
 
 ## Normal shutdown
 
 ### MCP mode
 
-The MCP process holds credentials in the filesystem, not in memory. Stopping the process is sufficient -- no cleanup is strictly required.
+In MCP mode, credentials exist only in process memory. When the MCP server process exits, credentials are gone -- there are no files to clean up.
 
-To revoke access immediately:
-
-```bash
-rm -f .raw_cookies .csrf_token
-```
-
-This prevents any further API calls until new credentials are provisioned.
+To revoke access, simply stop the MCP server process. No credential files need to be deleted.
 
 ### Interactive mode
 
 Same as above. There is no `logout` command. Delete the credential files to revoke the session.
 
-## Re-authentication in MCP (non-interactive) mode
+## Re-authentication in MCP mode
 
-When a session expires, `zoom_authed` calls `do_reauth()`. That function checks for an interactive terminal (`[[ -t 0 && -t 1 ]]`). MCP processes are never interactive, so reauth always fails with:
+When a session expires, the MCP server can re-launch the Playwright browser flow automatically, since the server owns the browser lifecycle.
 
-```
-Session expired and not running interactively. Run: ./zoom-cli.sh login
-```
+**Requirement:** Re-authentication needs an interactive display -- the Chromium window must be visible so the user can complete SSO/MFA. If the MCP server is running in a headless or remote environment without a display, re-auth will fail and the server must be restarted on a machine with a visible display.
 
-**This is expected behavior.** To recover:
+To recover from an expired session:
 
-1. On an interactive machine, run `./zoom-cli.sh login` or repeat the manual cookie injection steps (Path B above).
-2. The MCP server does not need to restart -- it reads `.raw_cookies` and `.csrf_token` from disk on every request.
+1. The MCP server detects the expired session and launches a new Chromium window.
+2. The user completes SSO/MFA in the browser.
+3. New credentials are captured into process memory and used for subsequent requests.
 
 ## Debug mode
 
