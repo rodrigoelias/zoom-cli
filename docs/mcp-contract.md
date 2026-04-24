@@ -174,6 +174,7 @@ The raw Zoom response nests meetings in `result.meetings[]`, where each entry is
 | `timeRange`        | `meetings[].list[].schTimeF`   | Passed through                                  |
 | `duration`         | `meetings[].list[].duration`   | Integer (minutes)                               |
 | `isRecurring`      | `meetings[].list[].type`       | `true` when `type == 8`, `false` otherwise      |
+| `totalRecords`     | `result.totalRecords`             | Integer; passed through                      |
 | `occurrenceInfo`   | `meetings[].list[].occurrenceTip` | `null` when empty string                     |
 
 ### Error Response Examples
@@ -289,7 +290,7 @@ Fields that do NOT use it (live at `result` level): `joinUrl`.
 | `duration`         | `result.meeting.duration`                              | `val()` unwrap; integer (minutes)                          |
 | `timezone`         | `result.meeting.timezone`                              | `val()` unwrap                                             |
 | `isRecurring`      | `result.meeting.recurring`                             | `val()` unwrap; boolean                                    |
-| `recurrenceType`   | `result.meeting.recurring.childParams.recurring.value.type` | Present only when `isRecurring == true`; `null` otherwise |
+| `recurrenceType`   | `result.meeting.recurring.childParams.recurring.value.type` | Present only when `isRecurring == true`; `null` otherwise. **Null-safety:** path is 5 levels deep — the MCP wrapper must use defensive traversal (check each level for null/missing) and return `null` if any intermediate is absent. |
 | `passcode`         | `result.meeting.passcode.childParams.meetingPasscode`  | `val()` unwrap; `null` if `childParams` is null/absent     |
 | `joinUrl`          | `result.joinUrl` or `result.join_url`                  | Not inside `meeting`; lives at `result` level (line 404)   |
 | `invitees`         | `result.meeting.invitee`                               | `val()` unwrap then extract `.email` or `.displayName`     |
