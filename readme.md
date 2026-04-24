@@ -1,305 +1,126 @@
-# 🎯 Zoom CLI - Manage Meetings from Command Line
+# zoom-cli
 
-A command-line interface for Zoom meeting management, built by reverse-engineering Zoom's internal API through Okta SSO authentication.
+> ⚠️ **Work in progress.** Only tested creating meetings (recurring, single, with invitees, etc). Everything else is experimental. Use at your own risk.
 
-**Status**: 🏗️ **Phase 2** — API Discovery (building next)
+A command-line tool for managing Zoom meetings. It talks directly to Zoom's internal web API using your browser session cookies — no OAuth app or API keys needed.
 
----
+## Windows
 
-## 🚀 Quick Start
+Waiting for your PR 😉
 
-### 1. Clone & Setup
+## Prerequisites
+
+- **bash** (macOS/Linux)
+- **curl**
+- **jq** — `brew install jq`
+- **Node.js** (for SSO login) — `brew install node`
+- **Playwright** — installed via `npm install`
+
+## Install
 
 ```bash
-git clone <repo-url> zoom-cli
+git clone git@github.com:rodrigoelias/zoom-cli.git
 cd zoom-cli
 npm install
+chmod +x zoom-cli.sh
 ```
 
-### 2. Capture Cookies (Okta SSO)
+## Authentication
+
+The CLI uses your Zoom web session cookies. There are two ways to set them up:
+
+### Option A: Automated login (recommended)
+
+Opens a browser window for SSO login, then captures the cookies automatically:
 
 ```bash
-npm run capture-cookies
+./zoom-cli.sh login
 ```
 
-This will:
-- Open Zoom.us in your browser
-- Redirect you to Okta login
-- Capture authenticated cookies after you complete SSO + MFA
-- Save cookies to `.cookies/.raw_cookies`
+### Option B: Manual cookie paste
 
-### 3. Discover API Endpoints
+1. Sign into [skyscanner.zoom.us](https://skyscanner.zoom.us) in your browser
+2. Open DevTools (F12) → Console → run: `copy(document.cookie)`
+3. Paste into the CLI:
 
 ```bash
-npm run sniff-api
+./zoom-cli.sh set-cookies "<paste>"
+./zoom-cli.sh refresh-csrf
 ```
 
-This will:
-- Load your captured cookies
-- Open Zoom.us with those cookies
-- Monitor all network requests as you navigate
-- Generate `docs/api-discovery.json` with endpoint catalog
+> **Note:** Session cookies expire after a few hours of inactivity. The CLI will automatically re-launch the browser for SSO if it detects an expired session (interactive terminals only).
 
-### 4. Run Tests
+## Usage
+
+### List meetings
 
 ```bash
-# All unit tests (no network, fast)
-npm test
-
-# With coverage report
-npm run test:coverage
-
-# Watch mode (for development)
-npm run test:watch
+./zoom-cli.sh list
 ```
 
----
-
-## 📋 Features (Planned)
-
-- [x] **Phase 1** — Session capture via Okta SSO
-- [x] **Phase 2** — API endpoint discovery (network sniffing)
-- [ ] **Phase 3** — Payload extraction & validation
-- [ ] **Phase 4** — CLI implementation
-  - [ ] `zoom meetings list` — View upcoming meetings
-  - [ ] `zoom meetings create` — Schedule a new meeting
-  - [ ] `zoom meetings view <id>` — Get meeting details
-  - [ ] `zoom meetings update <id>` — Edit a meeting
-  - [ ] `zoom meetings delete <id>` — Cancel a meeting
-  - [ ] `zoom join <id>` — Get join URL
-- [ ] **Phase 5** — Auto-reauth & error handling
-- [ ] **Phase 6** — Comprehensive testing
-
----
-
-## 📚 Project Structure
-
-```
-zoom-cli/
-├── scripts/
-│   ├── grab-cookies.ts      # Phase 1: Capture cookies via Okta
-│   └── sniff-api.ts         # Phase 2: Discover API endpoints
-├── src/
-│   ├── cookies.ts           # Cookie utilities (parsing, validation)
-│   ├── http-client.ts       # HTTP client with auth handling
-│   ├── zoom-api.ts          # Zoom API models & endpoints
-│   └── index.ts             # CLI entry point (TBD)
-├── tests/
-│   ├── cookies.test.ts      # ✅ Cookie tests
-│   ├── http-client.test.ts  # ✅ HTTP client tests
-│   ├── zoom-api.test.ts     # ✅ API model tests
-│   ├── offline/             # 🔲 Mocked HTTP integration tests
-│   └── e2e/                 # 🔲 Real API tests
-├── docs/
-│   ├── api-discovery.json   # Discovered endpoints (generated)
-│   ├── agents.md            # API findings for Claude
-│   └── captured-requests.jsonl
-├── TESTING_STRATEGY.md      # Test strategy & checklist
-├── package.json
-├── tsconfig.json
-└── jest.config.js
-
-.cookies/                     # 🔐 (gitignored)
-├── .raw_cookies            # Raw cookie string
-└── cookies.txt             # Netscape format
-```
-
----
-
-## 🔐 How It Works
-
-### Phase 1: Session Capture
+### View a meeting
 
 ```bash
-┌─ Your Machine ─────────────────────────────────────────┐
-│                                                         │
-│  npm run capture-cookies                               │
-│           ↓                                             │
-│  ┌─ Browser (Playwright) ────────────────────┐         │
-│  │                                           │         │
-│  │  zoom.us → Okta Login → SSO → MFA       │         │
-│  │                                           │         │
-│  │  ✓ Login complete                         │         │
-│  └───────────────────────────────────────────┘         │
-│           ↓                                             │
-│  context.cookies() ← captures httpOnly cookies         │
-│           ↓                                             │
-│  .cookies/.raw_cookies ← saved                         │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+./zoom-cli.sh view <meeting_id>
 ```
 
-**Why this works:**
-- `document.cookie` (JavaScript) can't access httpOnly cookies
-- Playwright's `context.cookies()` can (it's the browser)
-- SSO is handled automatically (browser does it)
-- Playwright waits for auth to complete
-
-### Phase 2: API Discovery
+### Create a meeting
 
 ```bash
-npm run sniff-api
-  ↓
-Playwright loads zoom.us with captured cookies
-  ↓
-You navigate: "View meetings" → "Schedule meeting" → etc.
-  ↓
-Every XHR/fetch call is intercepted & logged
-  ↓
-Generate: api-discovery.json with:
-  - endpoints (URL, method, required headers)
-  - request payloads (what fields are needed)
-  - response structures (what you get back)
-  - error patterns (what expired auth looks like)
+# Simple meeting
+./zoom-cli.sh create -t "Standup" -d 03/28/2026 --time 9:00 --ampm AM --duration 30
+
+# Recurring weekly meeting
+./zoom-cli.sh create -t "Weekly Sync" --recurring --recurrence-type WEEKLY --recurrence-days SA --time 10:00 --ampm AM
+
+# With invitees
+./zoom-cli.sh create -t "1:1" -i alice@example.com -i bob@example.com
 ```
 
-### Phase 3-6: Building the CLI
+#### Create options
 
-Once we have the API catalog, we'll:
-1. **Extract payload templates** from discovered requests
-2. **Build CLI commands** that map to API calls
-3. **Add auto-reauth** — detect expired sessions, re-login automatically
-4. **Full test coverage** — unit tests, mocked integration tests, real E2E tests
-5. **Documentation** — `agents.md` for future AI automation
+| Flag | Description | Default |
+|---|---|---|
+| `--topic`, `-t` | Meeting topic | `"My Meeting"` |
+| `--agenda`, `--desc` | Meeting description | |
+| `--date`, `-d` | Start date `MM/DD/YYYY` | today |
+| `--time` | Time `H:MM` | next round hour |
+| `--ampm` | `AM` or `PM` | `PM` |
+| `--duration` | Duration in minutes | `60` |
+| `--timezone`, `-tz` | Timezone | `Europe/London` |
+| `--invite`, `-i` | Invitee email (repeatable) | |
+| `--recurring`, `-r` | Enable recurrence | |
+| `--recurrence-type` | `DAILY`, `WEEKLY`, or `MONTHLY` | |
+| `--recurrence-interval` | Every N periods | `1` |
+| `--recurrence-days` | Day(s): `MO,TU,WE,TH,FR,SA,SU` | |
+| `--recurrence-end` | End date `MM/DD/YYYY` | |
 
----
-
-## 🧪 Testing
-
-All tests run **without network access**. See `TESTING_STRATEGY.md` for details.
-
-### Test Coverage
-
-```
-✅ Phase 1: Unit Tests (100% coverage)
-   - Cookie parsing & validation
-   - HTTP client with auth detection
-   - API model validation
-
-🔲 Phase 2: Offline Integration Tests (pending)
-   - Full workflows with mocked HTTP
-   - Auth expiry & recovery
-   - Error handling
-
-🔲 Phase 3: E2E Tests (pending)
-   - Real Zoom API calls
-   - Real credentials required
-```
-
-### Run Tests
+### Update a meeting
 
 ```bash
-# All tests
-npm test
-
-# Watch mode (for development)
-npm run test:watch
-
-# Coverage report
-npm run test:coverage
-
-# Specific test file
-npm test -- cookies.test.ts
+./zoom-cli.sh update <meeting_id> --topic "New Name" --time 2:00 --ampm PM
 ```
 
----
-
-## 🛠️ Commands Reference
-
-### Setup & Discovery
+### Delete a meeting
 
 ```bash
-npm run capture-cookies   # Phase 1: Get authenticated session
-npm run sniff-api         # Phase 2: Discover API endpoints
-npm run build             # Compile TypeScript
+./zoom-cli.sh delete <meeting_id>
 ```
 
-### Testing
+### Debug: raw API call
 
 ```bash
-npm test                  # Run all tests
-npm run test:watch       # Watch mode
-npm run test:coverage    # With coverage report
-npm run test:e2e         # E2E tests (requires credentials)
-npm run test:offline     # Offline integration tests
+./zoom-cli.sh raw POST /rest/meeting/list "listType=upcoming&page=1&pageSize=10"
 ```
 
-### Development
+## Running tests
+
+All tests run offline with mocked HTTP — no Zoom account needed:
 
 ```bash
-npm run dev              # Run CLI in dev mode
-npm run lint             # TypeScript check
+./test-zoom-cli.sh
 ```
 
----
+## License
 
-## 📖 Documentation
-
-- **[TESTING_STRATEGY.md](./TESTING_STRATEGY.md)** — Complete testing approach & checklist
-- **[docs/api-discovery.json](./docs/api-discovery.json)** — Discovered Zoom API endpoints (auto-generated)
-- **[docs/agents.md](./docs/agents.md)** — API findings formatted for Claude (TBD)
-- **[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)** — Development guide (TBD)
-
----
-
-## ⚠️ Important Notes
-
-### Security
-
-- Cookies are stored in `.cookies/` (git-ignored)
-- Never commit credentials or cookie files
-- Cookies expire — re-run `npm run capture-cookies` if needed
-- CSRF tokens are session-specific
-
-### Okta SSO
-
-- You must complete login in the browser (script can't automate MFA)
-- If you have U2F/hardware key, approve in the security key
-- Cookies capture works even with complex auth flows
-
-### macOS Compatibility
-
-- No `grep -P` (use `grep -oE` or Python instead)
-- `date` flags differ (use `date -v` not `date -d`)
-- Ensure `/bin/bash` not `/bin/sh`
-
----
-
-## 🤝 Contributing
-
-1. Add tests for any new functionality
-2. Ensure `npm test` passes before committing
-3. Update documentation (`TESTING_STRATEGY.md`, `README.md`)
-4. See `TESTING_STRATEGY.md` for test coverage expectations
-
----
-
-## 📊 Progress
-
-| Phase | Task | Status | Tests |
-|-------|------|--------|-------|
-| 1 | Cookie capture (Okta) | ✅ Done | ✅ 100% |
-| 2 | API discovery (sniffing) | ✅ Done | 📝 todo |
-| 3 | Payload extraction | 📋 Next | 📝 todo |
-| 4 | CLI implementation | 🔲 TBD | 📝 todo |
-| 5 | Auto-reauth & errors | 🔲 TBD | 📝 todo |
-| 6 | Full E2E testing | 🔲 TBD | 📝 todo |
-
----
-
-## 🔗 References
-
-- [Web-to-CLI Skill](/.agents/skills/web-to-cli/SKILL.md)
-- [Zoom API Docs](https://developers.zoom.us/docs/api/) (reference only; we're reverse-engineering)
-- [Playwright Docs](https://playwright.dev/)
-- [Jest Testing](https://jestjs.io/)
-
----
-
-## 📝 License
-
-TBD
-
----
-
-**Next**: See [TESTING_STRATEGY.md](./TESTING_STRATEGY.md) for detailed testing plan.
+MIT
