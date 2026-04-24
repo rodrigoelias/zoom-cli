@@ -47,7 +47,7 @@ When `ZOOM_DEBUG=1` is set, the `dbg()` function emits raw API response bodies t
 
 ### 4.1 No Secret Persistence to Disk in MCP Mode
 
-The CLI stores cookies in `.raw_cookies` and the CSRF token in `.csrf_token` (L17-18). In MCP mode:
+The CLI stores cookies in `.raw_cookies` and the CSRF token in `.csrf_token` (L16-17). In MCP mode:
 
 - Secrets (cookie string, CSRF token) must be passed at session startup and held **only in memory** (environment variables or in-process state).
 - The MCP wrapper must **never** write `.raw_cookies` or `.csrf_token` to disk.
@@ -75,7 +75,7 @@ Secrets must never appear in MCP tool output or diagnostic logs:
 | `dbg()` (L26)                   | Dumps raw response bodies to stderr          | Never set `ZOOM_DEBUG=1` in MCP mode            |
 | `zoom_get` / `zoom_post` (L183, L200) | Cookie string in curl `-H` flag       | Do not log curl commands; suppress `-v` output   |
 | `cmd_raw` (L709)                | Unrestricted API access                      | Exclude from MCP entirely                       |
-| `.raw_cookies` / `.csrf_token` (L17-18) | Secrets persisted to disk             | Use in-memory or ephemeral paths in MCP mode    |
+| `.raw_cookies` / `.csrf_token` (L16-17) | Secrets persisted to disk             | Use in-memory or ephemeral paths in MCP mode    |
 | `err()` calls with `${response:0:500}` | May include tokens in error output   | Redact or omit raw responses in MCP tool output |
 
 ## 6. Acceptance Criteria
