@@ -31,6 +31,7 @@ declare -A _CLASH_CACHE
 declare -A _DELETE_TOKENS        # token → meetingId
 declare -A _DELETE_TOKEN_EXPIRY  # token → epoch expiry
 _DELETE_TIMESTAMPS=()            # array of epoch timestamps for rate limiting
+_GENERATED_TOKEN=""              # set by generate_delete_token (avoids subshell)
 
 # Source zoom-cli.sh (loads functions, skips command dispatch via main guard)
 source "${SCRIPT_DIR}/zoom-cli.sh"
@@ -316,17 +317,19 @@ detect_clashes() {
 # Usage: token=$(generate_delete_token "$meeting_id")
 generate_delete_token() {
   local meeting_id="$1"
-  local token
-  token=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null) || token=""
-  if [[ -z "$token" ]]; then
+  local _raw_token
+  _raw_token=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null) || _raw_token=""
+  if [[ -z "$_raw_token" ]]; then
     warn "generate_delete_token: failed to generate UUID"
     return 1
   fi
   local expiry
   expiry=$(( $(date +%s) + 60 ))
-  _DELETE_TOKENS[$token]="$meeting_id"
-  _DELETE_TOKEN_EXPIRY[$token]="$expiry"
-  printf '%s' "$token"
+  # Assign to arrays in current shell (NOT via command substitution) so state persists.
+  _DELETE_TOKENS["$_raw_token"]="$meeting_id"
+  _DELETE_TOKEN_EXPIRY["$_raw_token"]="$expiry"
+  # Return token via global variable to avoid subshell call site.
+  _GENERATED_TOKEN="$_raw_token"
 }
 
 # validate_delete_token — returns 0 if valid, 1 if invalid/expired/wrong meeting.
@@ -1137,9 +1140,10 @@ tool_zoom_delete() {
     local topic
     topic=$(printf '%s' "$response" | jq -r '.result.meeting.topic.value // "Unknown"' 2>/dev/null) || true
 
-    # Generate token
-    local token
-    token=$(generate_delete_token "$meeting_id")
+    # Generate token — call directly (not via $()) so array state is preserved in this shell.
+    _GENERATED_TOKEN=""
+    generate_delete_token "$meeting_id" || { send_tool_error "$id" "INTERNAL_ERROR" "Failed to generate confirmation token." false; return; }
+    local token="$_GENERATED_TOKEN"
 
     audit_log "delete_token_issued" "$meeting_id" "$(jq -cn --arg topic "$topic" '{topic:$topic}')"
 
