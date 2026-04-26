@@ -2,8 +2,9 @@
 #
 # mcp-server.sh — MCP (Model Context Protocol) server for zoom-cli
 #
-# Exposes Zoom meeting data as read-only tools over JSON-RPC/stdio.
-# Tools: zoom_list, zoom_view, initialize_session
+# Exposes Zoom meeting tools over JSON-RPC/stdio.
+# Tools: zoom_list, zoom_view, initialize_session, zoom_create, zoom_update, zoom_delete
+# Write tools require ZOOM_CLI_WRITES_ENABLED=true (default: disabled).
 #
 # Usage:  ./mcp-server.sh   (reads JSON-RPC from stdin, writes to stdout)
 
@@ -223,6 +224,26 @@ append_to_clash_cache() {
   fi
 }
 
+# _clash_cache_key — compute the cache key for a given date (MM/DD/YYYY).
+# Prints "YYYY-MM-DD:YYYY-MM-DD" to stdout covering target ± 1-2 weeks.
+_clash_cache_key() {
+  local date="$1"
+  local target_epoch
+  target_epoch=$(date -j -f "%m/%d/%Y" "$date" "+%s" 2>/dev/null) || \
+    target_epoch=$(date -d "$date" "+%s" 2>/dev/null) || { printf ''; return 1; }
+
+  local range_start=$(( target_epoch - 7 * 86400 ))
+  local range_end=$(( target_epoch + 14 * 86400 ))
+
+  local fmt_start fmt_end
+  fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
+    fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
+  fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
+    fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
+
+  printf '%s' "${fmt_start}:${fmt_end}"
+}
+
 # detect_clashes — find meetings that overlap with the proposed time slot.
 # Usage: detect_clashes "$date" "$time" "$ampm" "$duration_mins"
 # Prints a JSON array of {meetingId, topic, timeRange} on stdout.
@@ -239,28 +260,12 @@ detect_clashes() {
   }
   local end_epoch=$(( start_epoch + duration_mins * 60 ))
 
-  # Build a date range key: target week + following week
-  # We fetch two weeks of meetings to catch edge cases near week boundaries.
-  # Derive startDate of the week containing our target date (Sunday-based)
-  local target_epoch
-  target_epoch=$(date -j -f "%m/%d/%Y" "$date" "+%s" 2>/dev/null) || \
-    target_epoch=$(date -d "$date" "+%s" 2>/dev/null) || target_epoch="$start_epoch"
-
-  # Range: target_epoch - 7 days  to  target_epoch + 14 days
-  local range_start range_end
-  range_start=$(( target_epoch - 7 * 86400 ))
-  range_end=$(( target_epoch + 14 * 86400 ))
-
-  local fmt_start fmt_end
-  fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
-    fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
-  fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
-    fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
-
-  local cache_key="${fmt_start}:${fmt_end}"
+  local cache_key
+  cache_key=$(_clash_cache_key "$date") || { printf '[]'; return 0; }
 
   # Populate cache if not already present
   if [[ -z "${_CLASH_CACHE[$cache_key]+_}" ]]; then
+    local fmt_start="${cache_key%%:*}" fmt_end="${cache_key##*:}"
     local params=("listType=upcoming" "page=1" "pageSize=50")
     [[ -n "$fmt_start" && -n "$fmt_end" ]] && \
       params+=("dateDuration=${fmt_start},${fmt_end}")
@@ -898,21 +903,10 @@ tool_zoom_create() {
   local clashes
   clashes=$(detect_clashes "$date" "$time" "$ampm" "$duration") || clashes="[]"
 
-  # Build the same cache key that detect_clashes uses, then append new meeting
-  local target_epoch
-  target_epoch=$(date -j -f "%m/%d/%Y" "$date" "+%s" 2>/dev/null) || \
-    target_epoch=$(date -d "$date" "+%s" 2>/dev/null) || target_epoch=""
-
-  if [[ -n "$target_epoch" ]]; then
-    local range_start range_end fmt_start fmt_end
-    range_start=$(( target_epoch - 7 * 86400 ))
-    range_end=$(( target_epoch + 14 * 86400 ))
-    fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
-      fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
-    fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
-      fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
-    local cache_key="${fmt_start}:${fmt_end}"
-
+  # Append new meeting to clash cache
+  local cache_key
+  cache_key=$(_clash_cache_key "$date") || true
+  if [[ -n "$cache_key" ]]; then
     local new_meeting_json
     new_meeting_json=$(jq -cn --arg mid "$meeting_id" --arg topic "$topic" \
       '{meetingId:$mid, topic:$topic, timeRange:null}') || true
@@ -1071,20 +1065,9 @@ tool_zoom_update() {
       clashes=$(detect_clashes "$clash_date" "$clash_time" "$clash_ampm" "$clash_duration") || clashes="[]"
 
       # Append updated meeting to clash cache
-      local target_epoch
-      target_epoch=$(date -j -f "%m/%d/%Y" "$clash_date" "+%s" 2>/dev/null) || \
-        target_epoch=$(date -d "$clash_date" "+%s" 2>/dev/null) || target_epoch=""
-
-      if [[ -n "$target_epoch" ]]; then
-        local range_start range_end fmt_start fmt_end
-        range_start=$(( target_epoch - 7 * 86400 ))
-        range_end=$(( target_epoch + 14 * 86400 ))
-        fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
-          fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
-        fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
-          fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
-        local cache_key="${fmt_start}:${fmt_end}"
-
+      local cache_key
+      cache_key=$(_clash_cache_key "$clash_date") || true
+      if [[ -n "$cache_key" ]]; then
         local updated_meeting_json
         updated_meeting_json=$(jq -cn --arg mid "$meeting_id" --arg t "$topic" \
           '{meetingId:$mid, topic:$t, timeRange:null}') || true
