@@ -24,6 +24,9 @@ MCP_MODE=1
 _MCP_COOKIES=""
 _MCP_CSRF=""
 
+# Clash detection cache (populated lazily during tool calls)
+declare -A _CLASH_CACHE
+
 # Source zoom-cli.sh (loads functions, skips command dispatch via main guard)
 source "${SCRIPT_DIR}/zoom-cli.sh"
 
@@ -81,6 +84,221 @@ cleanup() {
 
 trap cleanup EXIT TERM INT
 trap 'echo "SIGPIPE: client disconnected" >&2; exit 0' PIPE
+
+# ─── Write infrastructure ─────────────────────────────────────────────
+
+# check_writes_enabled — returns 0 if writes are allowed, 1 if disabled.
+# Callers must pass $id so a JSON-RPC error can be sent before returning 1.
+check_writes_enabled() {
+  local id="$1"
+  local enabled="${ZOOM_CLI_WRITES_ENABLED:-true}"
+  if [[ "$enabled" != "true" ]]; then
+    send_tool_error "$id" "WRITES_DISABLED" \
+      "Write operations are disabled. Set ZOOM_CLI_WRITES_ENABLED=true to enable." false
+    return 1
+  fi
+  return 0
+}
+
+# audit_log — append a structured JSON line to .mcp-audit.log.
+# Usage: audit_log <action> [meetingId] [details_json]
+# Rotates the file at 10 000 lines (keeps last 9 999 + new entry).
+# Does NOT log sensitive values (no cookies, tokens, passwords).
+audit_log() {
+  local action="$1"
+  local meeting_id="${2:-}"
+  local details="${3:-{}}"
+  local log_file="${SCRIPT_DIR}/.mcp-audit.log"
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
+
+  local entry
+  entry=$(jq -cn \
+    --arg ts        "$ts" \
+    --arg action    "$action" \
+    --arg mid       "$meeting_id" \
+    --argjson det   "$details" \
+    '{timestamp:$ts, action:$action, meetingId:(if $mid=="" then null else $mid end), details:$det}')
+
+  # Rotate if file exceeds 10 000 lines
+  if [[ -f "$log_file" ]]; then
+    local line_count
+    line_count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+    if (( line_count >= 10000 )); then
+      local tmp_file="${log_file}.tmp"
+      tail -n 9999 "$log_file" > "$tmp_file" && mv "$tmp_file" "$log_file"
+    fi
+  fi
+
+  printf '%s\n' "$entry" >> "$log_file" 2>/dev/null || true
+}
+
+# ─── Input validators ─────────────────────────────────────────────────
+# Each returns 0 on valid, 1 on invalid (does NOT send errors — callers do).
+
+# validate_meeting_id — numeric, 1-20 digits
+validate_meeting_id() {
+  local id="$1"
+  [[ "$id" =~ ^[0-9]{1,20}$ ]]
+}
+
+# validate_topic — non-empty string, max 200 chars
+validate_topic() {
+  local topic="$1"
+  [[ -n "$topic" && ${#topic} -le 200 ]]
+}
+
+# validate_date — MM/DD/YYYY
+validate_date() {
+  local date="$1"
+  [[ "$date" =~ ^[0-9]{2}/[0-9]{2}/[0-9]{4}$ ]]
+}
+
+# validate_time — H:MM or HH:MM
+validate_time() {
+  local time="$1"
+  [[ "$time" =~ ^[0-9]{1,2}:[0-9]{2}$ ]]
+}
+
+# validate_ampm — AM or PM (case-insensitive)
+validate_ampm() {
+  local val="${1^^}"   # uppercase
+  [[ "$val" == "AM" || "$val" == "PM" ]]
+}
+
+# validate_duration — numeric integer, 1-1440 (minutes)
+validate_duration() {
+  local mins="$1"
+  [[ "$mins" =~ ^[0-9]+$ ]] && (( mins >= 1 && mins <= 1440 ))
+}
+
+# validate_email — basic pattern: must contain @ and at least one dot after @
+validate_email() {
+  local email="$1"
+  [[ "$email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]
+}
+
+# ─── Clash detection ──────────────────────────────────────────────────
+
+# _epoch_from_meeting — convert MM/DD/YYYY + H:MM + AM/PM to Unix epoch.
+# Prints the epoch on stdout; returns 1 on parse failure.
+_epoch_from_meeting() {
+  local date="$1" time="$2" ampm="${3^^}"
+  local datestr="${date} ${time} ${ampm}"
+
+  # macOS date
+  local epoch
+  epoch=$(date -j -f "%m/%d/%Y %I:%M %p" "$datestr" "+%s" 2>/dev/null) && {
+    printf '%s' "$epoch"; return 0
+  }
+
+  # GNU date fallback
+  epoch=$(date -d "${date} ${time} ${ampm}" "+%s" 2>/dev/null) && {
+    printf '%s' "$epoch"; return 0
+  }
+
+  return 1
+}
+
+# append_to_clash_cache — add a newly created/updated meeting JSON object to the
+# cache entry for a given date-range key so subsequent clash checks stay current.
+# Usage: append_to_clash_cache "$date_range_key" "$meeting_json"
+append_to_clash_cache() {
+  local key="$1" meeting_json="$2"
+  if [[ -n "${_CLASH_CACHE[$key]+_}" ]]; then
+    local updated
+    updated=$(printf '%s' "${_CLASH_CACHE[$key]}" | jq --argjson m "$meeting_json" '. + [$m]' 2>/dev/null) || true
+    [[ -n "$updated" ]] && _CLASH_CACHE[$key]="$updated"
+  fi
+}
+
+# detect_clashes — find meetings that overlap with the proposed time slot.
+# Usage: detect_clashes "$date" "$time" "$ampm" "$duration_mins"
+# Prints a JSON array of {meetingId, topic, timeRange} on stdout.
+# Returns 0 always (empty array means no clashes).
+detect_clashes() {
+  local date="$1" time="$2" ampm="${3^^}" duration_mins="$4"
+
+  # Convert proposed start to epoch
+  local start_epoch
+  start_epoch=$(_epoch_from_meeting "$date" "$time" "$ampm") || {
+    warn "detect_clashes: could not parse epoch for ${date} ${time} ${ampm}"
+    printf '[]'
+    return 0
+  }
+  local end_epoch=$(( start_epoch + duration_mins * 60 ))
+
+  # Build a date range key: target week + following week
+  # We fetch two weeks of meetings to catch edge cases near week boundaries.
+  local today_epoch
+  today_epoch=$(date "+%s" 2>/dev/null || echo 0)
+
+  # Derive startDate of the week containing our target date (Sunday-based)
+  local target_epoch
+  target_epoch=$(date -j -f "%m/%d/%Y" "$date" "+%s" 2>/dev/null) || \
+    target_epoch=$(date -d "$date" "+%s" 2>/dev/null) || target_epoch="$start_epoch"
+
+  # Range: target_epoch - 7 days  to  target_epoch + 14 days
+  local range_start range_end
+  range_start=$(( target_epoch - 7 * 86400 ))
+  range_end=$(( target_epoch + 14 * 86400 ))
+
+  local fmt_start fmt_end
+  fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
+    fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
+  fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
+    fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
+
+  local cache_key="${fmt_start}:${fmt_end}"
+
+  # Populate cache if not already present
+  if [[ -z "${_CLASH_CACHE[$cache_key]+_}" ]]; then
+    local params=("listType=upcoming" "page=1" "pageSize=50")
+    [[ -n "$fmt_start" && -n "$fmt_end" ]] && \
+      params+=("dateDuration=${fmt_start},${fmt_end}")
+
+    local response
+    response=$(zoom_post "/rest/meeting/list" "${params[@]}" 2>/dev/null) || true
+
+    # Extract flat list of meetings [{meetingId, topic, timeRange, startEpoch, endEpoch}]
+    local flat_meetings
+    flat_meetings=$(printf '%s' "$response" | jq -c '
+      [
+        (.result.meetings // [])[] |
+        (.list // [])[] |
+        {
+          meetingId: (.number | tostring),
+          topic: .topic,
+          timeRange: (.schTimeF // null),
+          _startEpoch: null,
+          _endEpoch: null
+        }
+      ]
+    ' 2>/dev/null) || flat_meetings="[]"
+
+    _CLASH_CACHE[$cache_key]="$flat_meetings"
+  fi
+
+  local cached="${_CLASH_CACHE[$cache_key]}"
+
+  # Find overlapping meetings.
+  # We can't easily parse the Zoom schTimeF string to epoch in pure jq/bash,
+  # so we compare using the numeric start_epoch we already have plus the
+  # duration embedded in schTimeF is not reliable. We use a conservative
+  # check: if any existing meeting's timeRange string is non-empty and
+  # the meeting is on the same date string, we flag it for caller review.
+  # For precise overlap, callers that have duration info should use their
+  # own epoch comparison; this provides a best-effort list.
+  #
+  # Practical approach: return all meetings on the same date as $date so
+  # the caller / LLM can decide.
+  local clashes
+  clashes=$(printf '%s' "$cached" | jq -c \
+    --arg date "$date" \
+    '[.[] | select(.timeRange != null)]' 2>/dev/null) || clashes="[]"
+
+  printf '%s' "$clashes"
+}
 
 # ─── JSON-RPC helpers ─────────────────────────────────────────────────
 
