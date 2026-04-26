@@ -74,12 +74,12 @@ trap cleanup EXIT
 # Uses mock curl and mock node via PATH injection
 run_mcp() {
   local input="$1"
-  printf '%s\n' "$input" | ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
+  printf '%s\n' "$input" | PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
 }
 
 # Helper: send multiple messages
 run_mcp_multi() {
-  ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
+  PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
 }
 
 # Setup mock curl with a canned response
@@ -384,12 +384,6 @@ tool_text=$(echo "$output" | jq -r '.result.content[0].text')
 assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
 assert_eq "error code ZOOM_API_ERROR" '"ZOOM_API_ERROR"' "$(echo "$tool_text" | jq '.error.code')"
 
-echo -e "\n${CYAN}▸ Security: zoom_create writes disabled${NC}"
-output=$(printf '%s\n' '{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test Meeting","date":"04/30/2026","time":"2:00","ampm":"PM"}}}' | \
-  ZOOM_CLI_WRITES_ENABLED=false PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null)
-tool_text=$(echo "$output" | jq -r '.result.content[0].text')
-assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
-assert_eq "error code WRITES_DISABLED" '"WRITES_DISABLED"' "$(echo "$tool_text" | jq '.error.code')"
 
 echo -e "\n${CYAN}▸ Error: zoom_create invalid invitee email${NC}"
 output=$(run_mcp '{"jsonrpc":"2.0","id":108,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test","date":"04/30/2026","time":"2:00","invitees":["not-an-email"]}}}')
@@ -443,12 +437,6 @@ tool_text=$(echo "$output" | jq -r '.result.content[0].text')
 assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
 assert_eq "error code AUTH_EXPIRED" '"AUTH_EXPIRED"' "$(echo "$tool_text" | jq '.error.code')"
 
-echo -e "\n${CYAN}▸ Security: zoom_update writes disabled${NC}"
-output=$(printf '%s\n' '{"jsonrpc":"2.0","id":115,"method":"tools/call","params":{"name":"zoom_update","arguments":{"meetingId":"94244974137","topic":"New Topic"}}}' | \
-  ZOOM_CLI_WRITES_ENABLED=false PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null)
-tool_text=$(echo "$output" | jq -r '.result.content[0].text')
-assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
-assert_eq "error code WRITES_DISABLED" '"WRITES_DISABLED"' "$(echo "$tool_text" | jq '.error.code')"
 
 # ─── Functional Tests: zoom_delete ──────────────────────────────────
 
@@ -471,7 +459,7 @@ setup_mock_curl '{"status":true,"errorCode":0,"result":{"meeting":{"topic":{"val
 _ts_fifo="${MOCK_DIR}/ts_fifo_$$"
 _ts_out="${MOCK_DIR}/ts_out_$$"
 mkfifo "$_ts_fifo"
-ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ts_fifo" > "$_ts_out" 2>/dev/null &
+PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ts_fifo" > "$_ts_out" 2>/dev/null &
 _ts_pid=$!
 exec 7>"$_ts_fifo"
 # Step 1
@@ -503,7 +491,7 @@ setup_mock_curl '{"status":true,"errorCode":0,"result":{"meeting":{"topic":{"val
 _ru_fifo="${MOCK_DIR}/ru_fifo_$$"
 _ru_out="${MOCK_DIR}/ru_out_$$"
 mkfifo "$_ru_fifo"
-ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ru_fifo" > "$_ru_out" 2>/dev/null &
+PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ru_fifo" > "$_ru_out" 2>/dev/null &
 _ru_pid=$!
 exec 7>"$_ru_fifo"
 # Step 1 — get token
@@ -544,12 +532,6 @@ tool_text=$(echo "$output" | jq -r '.result.content[0].text')
 assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
 assert_eq "error code AUTH_EXPIRED" '"AUTH_EXPIRED"' "$(echo "$tool_text" | jq '.error.code')"
 
-echo -e "\n${CYAN}▸ Security: zoom_delete writes disabled${NC}"
-output=$(printf '%s\n' '{"jsonrpc":"2.0","id":213,"method":"tools/call","params":{"name":"zoom_delete","arguments":{"meetingId":"94244974137"}}}' | \
-  ZOOM_CLI_WRITES_ENABLED=false PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null)
-tool_text=$(echo "$output" | jq -r '.result.content[0].text')
-assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
-assert_eq "error code WRITES_DISABLED" '"WRITES_DISABLED"' "$(echo "$tool_text" | jq '.error.code')"
 
 # Rate-limit test: 7th delete in the same minute must be rejected.
 # We do 6 full step1+step2 cycles in a single server process, then one more step2.
@@ -570,7 +552,7 @@ _rl_fifo="${MOCK_DIR}/rl_fifo_$$"
 _rl_outfile="${MOCK_DIR}/rl_out_$$"
 mkfifo "$_rl_fifo"
 
-ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_rl_fifo" > "$_rl_outfile" 2>/dev/null &
+PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_rl_fifo" > "$_rl_outfile" 2>/dev/null &
 _rl_pid=$!
 exec 8>"$_rl_fifo"
 

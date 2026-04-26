@@ -4,7 +4,6 @@
 #
 # Exposes Zoom meeting tools over JSON-RPC/stdio.
 # Tools: zoom_list, zoom_view, initialize_session, zoom_create, zoom_update, zoom_delete
-# Write tools require ZOOM_CLI_WRITES_ENABLED=true (default: disabled).
 #
 # Usage:  ./mcp-server.sh   (reads JSON-RPC from stdin, writes to stdout)
 
@@ -94,18 +93,6 @@ trap 'echo "SIGPIPE: client disconnected" >&2; exit 0' PIPE
 
 # ─── Write infrastructure ─────────────────────────────────────────────
 
-# check_writes_enabled — returns 0 if writes are allowed, 1 if disabled.
-# Callers must pass $id so a JSON-RPC error can be sent before returning 1.
-check_writes_enabled() {
-  local id="$1"
-  local enabled="${ZOOM_CLI_WRITES_ENABLED:-false}"
-  if [[ "$enabled" != "true" ]]; then
-    send_tool_error "$id" "WRITES_DISABLED" \
-      "Write operations are disabled. Set ZOOM_CLI_WRITES_ENABLED=true to enable." false
-    return 1
-  fi
-  return 0
-}
 
 # audit_log — append a structured JSON line to .mcp-audit.log.
 # Usage: audit_log <action> [meetingId] [details_json]
@@ -786,7 +773,6 @@ tool_zoom_create() {
   local id="$1" line="$2"
 
   # 1. Check writes enabled
-  check_writes_enabled "$id" || return
 
   # 2. Parse each input individually to avoid IFS/tsv empty-field collapsing issues
   local topic date time ampm duration timezone invitees_csv
@@ -934,7 +920,6 @@ tool_zoom_update() {
   local id="$1" line="$2"
 
   # 1. Check writes enabled
-  check_writes_enabled "$id" || return
 
   # 2. Parse each input individually to avoid IFS/tsv empty-field collapsing issues
   local meeting_id topic date time ampm duration_hr duration_min
@@ -1094,7 +1079,6 @@ tool_zoom_update() {
 tool_zoom_delete() {
   local id="$1" line="$2"
 
-  check_writes_enabled "$id" || return
 
   # Parse inputs
   local meeting_id confirm_token
