@@ -385,6 +385,24 @@ handle_tools_list() {
           "required":[],
           "additionalProperties":false
         }
+      },
+      {
+        "name":"zoom_create",
+        "description":"Create a new Zoom meeting. Returns meeting ID, join URL, and any scheduling clashes detected.",
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "topic":{"type":"string","description":"Meeting topic/title.","maxLength":200},
+            "date":{"type":"string","pattern":"^[0-9]{2}/[0-9]{2}/[0-9]{4}$","description":"Start date in MM/DD/YYYY format."},
+            "time":{"type":"string","pattern":"^[0-9]{1,2}:[0-9]{2}$","description":"Start time in H:MM or HH:MM format."},
+            "ampm":{"type":"string","enum":["AM","PM"],"default":"PM","description":"AM or PM."},
+            "duration":{"type":"integer","minimum":1,"maximum":1440,"default":60,"description":"Duration in minutes."},
+            "timezone":{"type":"string","default":"Europe/London","description":"IANA timezone."},
+            "invitees":{"type":"array","items":{"type":"string"},"description":"Email addresses of invitees."}
+          },
+          "required":["topic","date","time"],
+          "additionalProperties":false
+        }
       }
     ]
   }'
@@ -400,6 +418,7 @@ handle_tools_call() {
     zoom_list)          tool_zoom_list "$id" "$line" ;;
     zoom_view)          tool_zoom_view "$id" "$line" ;;
     initialize_session) tool_initialize_session "$id" "$line" ;;
+    zoom_create)        tool_zoom_create "$id" "$line" ;;
     *)
       send_tool_error "$id" "BAD_INPUT" "Unknown tool: ${tool_name:-<empty>}" false
       ;;
@@ -621,6 +640,168 @@ tool_initialize_session() {
   rm -f "${SCRIPT_DIR}/.csrf_token"
 
   send_tool_result "$id" '{"ok":true,"data":{"status":"session_ready"}}'
+}
+
+tool_zoom_create() {
+  local id="$1" line="$2"
+
+  # 1. Check writes enabled
+  check_writes_enabled "$id" || return
+
+  # 2. Parse all inputs in a single jq call
+  local topic date time ampm duration timezone invitees_csv
+  read -r topic date time ampm duration timezone invitees_csv < <(printf '%s' "$line" | jq -r \
+    '[
+      (.params.arguments.topic // ""),
+      (.params.arguments.date // ""),
+      (.params.arguments.time // ""),
+      (.params.arguments.ampm // "PM"),
+      (.params.arguments.duration // 60 | tostring),
+      (.params.arguments.timezone // "Europe/London"),
+      ((.params.arguments.invitees // []) | join(","))
+    ] | @tsv' 2>/dev/null) || true
+
+  # 3. Validate required fields
+  if ! validate_topic "$topic"; then
+    send_tool_error "$id" "BAD_INPUT" "topic is required and must be at most 200 characters." false
+    return
+  fi
+
+  if ! validate_date "$date"; then
+    send_tool_error "$id" "BAD_INPUT" "date must be in MM/DD/YYYY format (got: ${date:0:50})." false
+    return
+  fi
+
+  if ! validate_time "$time"; then
+    send_tool_error "$id" "BAD_INPUT" "time must be in H:MM or HH:MM format (got: ${time:0:20})." false
+    return
+  fi
+
+  if ! validate_ampm "$ampm"; then
+    send_tool_error "$id" "BAD_INPUT" "ampm must be AM or PM (got: ${ampm:0:10})." false
+    return
+  fi
+
+  if ! validate_duration "$duration"; then
+    send_tool_error "$id" "BAD_INPUT" "duration must be an integer between 1 and 1440 (got: ${duration:0:10})." false
+    return
+  fi
+
+  # Validate each invitee email if provided
+  if [[ -n "$invitees_csv" ]]; then
+    IFS=',' read -ra _invitee_list <<< "$invitees_csv"
+    for _email in "${_invitee_list[@]}"; do
+      _email="${_email# }"; _email="${_email% }"  # trim spaces
+      if ! validate_email "$_email"; then
+        send_tool_error "$id" "BAD_INPUT" "Invalid invitee email address: ${_email:0:100}" false
+        return
+      fi
+    done
+  fi
+
+  # 4. Audit create_attempt
+  local audit_details
+  audit_details=$(jq -cn --arg topic "$topic" --arg date "$date" --arg time "$time" --arg ampm "$ampm" \
+    '{topic:$topic, date:$date, time:$time, ampm:$ampm}') || audit_details='{}'
+  audit_log "create_attempt" "" "$audit_details"
+
+  # 5. Build payload: pipe JSON args to build_create_payload
+  local payload
+  payload=$(jq -cn \
+    --arg topic      "$topic" \
+    --arg date       "$date" \
+    --arg time       "$time" \
+    --arg ampm       "$ampm" \
+    --argjson duration "$duration" \
+    --arg timezone   "$timezone" \
+    --arg invitees   "$invitees_csv" \
+    '{topic:$topic, agenda:"", date:$date, time:$time, ampm:$ampm, duration:$duration, timezone:$timezone, invitees:$invitees, recurring:false, recurrence_type:"", recurrence_interval:"1", recurrence_end:"", recurrence_days:""}' \
+    | build_create_payload 2>/dev/null) || true
+
+  if [[ -z "$payload" ]]; then
+    audit_log "create_failure" "" '{"reason":"payload_build_failed"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Failed to build meeting creation payload." false
+    return
+  fi
+
+  # 6. Call Zoom API
+  local response
+  response=$(zoom_post_json "/rest/meeting/save" "$payload" 2>/dev/null) || true
+
+  if [[ -z "$response" ]]; then
+    audit_log "create_failure" "" '{"reason":"empty_api_response"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+    return
+  fi
+
+  # 7. Check auth expiry
+  if is_auth_expired "$response"; then
+    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." false
+    return
+  fi
+
+  # Check API-level error
+  local status
+  status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+  if [[ "$status" != "true" ]]; then
+    local error_msg
+    error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Unknown API error"' 2>/dev/null) || true
+    audit_log "create_failure" "" "$(jq -cn --arg reason "$error_msg" '{reason:$reason}')"
+    send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+    return
+  fi
+
+  # 8. Extract meetingId and joinUrl from response
+  local meeting_id join_url
+  meeting_id=$(printf '%s' "$response" | jq -r '(.result.mn // .result.meetingNumber // "") | tostring' 2>/dev/null) || true
+  join_url=$(printf '%s' "$response" | jq -r '.result.joinLink // .result.joinUrl // ""' 2>/dev/null) || true
+
+  if [[ -z "$meeting_id" || "$meeting_id" == "null" || "$meeting_id" == "" ]]; then
+    audit_log "create_failure" "" '{"reason":"missing_meeting_id_in_response"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Meeting created but could not extract meeting ID from response." false
+    return
+  fi
+
+  # 9. Run detect_clashes and append new meeting to cache
+  local clashes
+  clashes=$(detect_clashes "$date" "$time" "$ampm" "$duration") || clashes="[]"
+
+  # Build the same cache key that detect_clashes uses, then append new meeting
+  local target_epoch
+  target_epoch=$(date -j -f "%m/%d/%Y" "$date" "+%s" 2>/dev/null) || \
+    target_epoch=$(date -d "$date" "+%s" 2>/dev/null) || target_epoch=""
+
+  if [[ -n "$target_epoch" ]]; then
+    local range_start range_end fmt_start fmt_end
+    range_start=$(( target_epoch - 7 * 86400 ))
+    range_end=$(( target_epoch + 14 * 86400 ))
+    fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
+      fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
+    fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
+      fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
+    local cache_key="${fmt_start}:${fmt_end}"
+
+    local new_meeting_json
+    new_meeting_json=$(jq -cn --arg mid "$meeting_id" --arg topic "$topic" \
+      '{meetingId:$mid, topic:$topic, timeRange:null}') || true
+    [[ -n "$new_meeting_json" ]] && append_to_clash_cache "$cache_key" "$new_meeting_json"
+  fi
+
+  # 10. Audit success
+  local clashes_count
+  clashes_count=$(printf '%s' "$clashes" | jq 'length' 2>/dev/null) || clashes_count=0
+  audit_log "create_success" "$meeting_id" \
+    "$(jq -cn --arg url "$join_url" --argjson n "$clashes_count" '{joinUrl:$url, clashes_count:$n}')"
+
+  # 11. Return result
+  local result
+  result=$(jq -cn \
+    --arg mid     "$meeting_id" \
+    --arg url     "$join_url" \
+    --arg topic   "$topic" \
+    --argjson clashes "$clashes" \
+    '{ok:true, data:{meetingId:$mid, joinUrl:$url, topic:$topic, clashes:$clashes}}')
+  send_tool_result "$id" "$result"
 }
 
 # ─── Main loop ────────────────────────────────────────────────────────
