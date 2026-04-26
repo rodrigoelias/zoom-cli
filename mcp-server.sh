@@ -2,8 +2,8 @@
 #
 # mcp-server.sh — MCP (Model Context Protocol) server for zoom-cli
 #
-# Exposes Zoom meeting data as read-only tools over JSON-RPC/stdio.
-# Tools: zoom_list, zoom_view, initialize_session
+# Exposes Zoom meeting tools over JSON-RPC/stdio.
+# Tools: zoom_list, zoom_view, initialize_session, zoom_create, zoom_update, zoom_delete
 #
 # Usage:  ./mcp-server.sh   (reads JSON-RPC from stdin, writes to stdout)
 
@@ -23,6 +23,15 @@ done
 MCP_MODE=1
 _MCP_COOKIES=""
 _MCP_CSRF=""
+
+# Clash detection cache (populated lazily during tool calls)
+declare -A _CLASH_CACHE
+
+# Delete confirmation state (in-memory, per-server-instance)
+declare -A _DELETE_TOKENS        # token → meetingId
+declare -A _DELETE_TOKEN_EXPIRY  # token → epoch expiry
+_DELETE_TIMESTAMPS=()            # array of epoch timestamps for rate limiting
+_GENERATED_TOKEN=""              # set by generate_delete_token (avoids subshell)
 
 # Source zoom-cli.sh (loads functions, skips command dispatch via main guard)
 source "${SCRIPT_DIR}/zoom-cli.sh"
@@ -81,6 +90,309 @@ cleanup() {
 
 trap cleanup EXIT TERM INT
 trap 'echo "SIGPIPE: client disconnected" >&2; exit 0' PIPE
+
+# ─── Write infrastructure ─────────────────────────────────────────────
+
+
+# audit_log — append a structured JSON line to .mcp-audit.log.
+# Usage: audit_log <action> [meetingId] [details_json]
+# Rotates the file at 10 000 lines (keeps last 9 999 + new entry).
+# Does NOT log sensitive values (no cookies, tokens, passwords).
+audit_log() {
+  local action="$1"
+  local meeting_id="${2:-}"
+  local details="${3:-{}}"
+  local log_file="${SCRIPT_DIR}/.mcp-audit.log"
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
+
+  # Ensure details is valid JSON
+  if ! printf '%s' "$details" | jq empty 2>/dev/null; then
+    details='{}'
+  fi
+
+  local entry
+  entry=$(jq -cn \
+    --arg ts        "$ts" \
+    --arg action    "$action" \
+    --arg mid       "$meeting_id" \
+    --argjson det   "$details" \
+    '{timestamp:$ts, action:$action, meetingId:(if $mid=="" then null else $mid end), details:$det}') || return
+
+  # Rotate if file exceeds 10 000 lines
+  if [[ -f "$log_file" ]]; then
+    local line_count
+    line_count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+    if (( line_count >= 10000 )); then
+      local tmp_file="${log_file}.tmp"
+      tail -n 9999 "$log_file" > "$tmp_file" && mv "$tmp_file" "$log_file"
+    fi
+  fi
+
+  printf '%s\n' "$entry" >> "$log_file" 2>/dev/null || true
+}
+
+# ─── Input validators ─────────────────────────────────────────────────
+# Each returns 0 on valid, 1 on invalid (does NOT send errors — callers do).
+
+# validate_meeting_id — numeric, 1-20 digits
+validate_meeting_id() {
+  local id="$1"
+  [[ "$id" =~ ^[0-9]{1,20}$ ]]
+}
+
+# validate_topic — non-empty string, max 200 chars
+validate_topic() {
+  local topic="$1"
+  [[ -n "$topic" && ${#topic} -le 200 ]]
+}
+
+# validate_date — MM/DD/YYYY
+validate_date() {
+  local date="$1"
+  [[ "$date" =~ ^[0-9]{2}/[0-9]{2}/[0-9]{4}$ ]]
+}
+
+# validate_time — H:MM or HH:MM
+validate_time() {
+  local time="$1"
+  [[ "$time" =~ ^[0-9]{1,2}:[0-9]{2}$ ]]
+}
+
+# validate_ampm — AM or PM (case-insensitive)
+validate_ampm() {
+  local val="${1^^}"   # uppercase
+  [[ "$val" == "AM" || "$val" == "PM" ]]
+}
+
+# validate_duration — numeric integer, 1-1440 (minutes)
+validate_duration() {
+  local mins="$1"
+  [[ "$mins" =~ ^[0-9]+$ ]] && (( mins >= 1 && mins <= 1440 ))
+}
+
+# validate_email — basic pattern: must contain @ and at least one dot after @
+validate_email() {
+  local email="$1"
+  [[ "$email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]
+}
+
+# ─── Clash detection ──────────────────────────────────────────────────
+
+# _epoch_from_meeting — convert MM/DD/YYYY + H:MM + AM/PM to Unix epoch.
+# Prints the epoch on stdout; returns 1 on parse failure.
+_epoch_from_meeting() {
+  local date="$1" time="$2" ampm="${3^^}"
+  local datestr="${date} ${time} ${ampm}"
+
+  # macOS date
+  local epoch
+  epoch=$(date -j -f "%m/%d/%Y %I:%M %p" "$datestr" "+%s" 2>/dev/null) && {
+    printf '%s' "$epoch"; return 0
+  }
+
+  # GNU date fallback
+  epoch=$(date -d "${date} ${time} ${ampm}" "+%s" 2>/dev/null) && {
+    printf '%s' "$epoch"; return 0
+  }
+
+  return 1
+}
+
+# append_to_clash_cache — add a newly created/updated meeting JSON object to the
+# cache entry for a given date-range key so subsequent clash checks stay current.
+# Usage: append_to_clash_cache "$date_range_key" "$meeting_json"
+append_to_clash_cache() {
+  local key="$1" meeting_json="$2"
+  if [[ -n "${_CLASH_CACHE[$key]+_}" ]]; then
+    local updated
+    updated=$(printf '%s' "${_CLASH_CACHE[$key]}" | jq --argjson m "$meeting_json" '. + [$m]' 2>/dev/null) || true
+    [[ -n "$updated" ]] && _CLASH_CACHE[$key]="$updated"
+  fi
+}
+
+# _clash_cache_key — compute the cache key for a given date (MM/DD/YYYY).
+# Prints "YYYY-MM-DD:YYYY-MM-DD" to stdout covering target ± 1-2 weeks.
+_clash_cache_key() {
+  local date="$1"
+  local target_epoch
+  target_epoch=$(date -j -f "%m/%d/%Y" "$date" "+%s" 2>/dev/null) || \
+    target_epoch=$(date -d "$date" "+%s" 2>/dev/null) || { printf ''; return 1; }
+
+  local range_start=$(( target_epoch - 7 * 86400 ))
+  local range_end=$(( target_epoch + 14 * 86400 ))
+
+  local fmt_start fmt_end
+  fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
+    fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
+  fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
+    fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
+
+  printf '%s' "${fmt_start}:${fmt_end}"
+}
+
+# detect_clashes — find meetings that overlap with the proposed time slot.
+# Usage: detect_clashes "$date" "$time" "$ampm" "$duration_mins"
+# Prints a JSON array of {meetingId, topic, timeRange} on stdout.
+# Returns 0 always (empty array means no clashes).
+detect_clashes() {
+  local date="$1" time="$2" ampm="${3^^}" duration_mins="$4"
+
+  # Convert proposed start to epoch
+  local start_epoch
+  start_epoch=$(_epoch_from_meeting "$date" "$time" "$ampm") || {
+    warn "detect_clashes: could not parse epoch for ${date} ${time} ${ampm}"
+    printf '[]'
+    return 0
+  }
+  local end_epoch=$(( start_epoch + duration_mins * 60 ))
+
+  local cache_key
+  cache_key=$(_clash_cache_key "$date") || { printf '[]'; return 0; }
+
+  # Populate cache if not already present
+  if [[ -z "${_CLASH_CACHE[$cache_key]+_}" ]]; then
+    local fmt_start="${cache_key%%:*}" fmt_end="${cache_key##*:}"
+    local params=("listType=upcoming" "page=1" "pageSize=50")
+    [[ -n "$fmt_start" && -n "$fmt_end" ]] && \
+      params+=("dateDuration=${fmt_start},${fmt_end}")
+
+    local response
+    response=$(zoom_post "/rest/meeting/list" "${params[@]}" 2>/dev/null) || true
+
+    # Extract flat list of meetings with their date group
+    local flat_meetings
+    flat_meetings=$(printf '%s' "$response" | jq -c '
+      [
+        (.result.meetings // [])[] |
+        .time as $date_group |
+        (.list // [])[] |
+        {
+          meetingId: (.number | tostring),
+          topic: .topic,
+          timeRange: (.schTimeF // null),
+          dateGroup: $date_group
+        }
+      ]
+    ' 2>/dev/null) || flat_meetings="[]"
+
+    _CLASH_CACHE[$cache_key]="$flat_meetings"
+  fi
+
+  local cached="${_CLASH_CACHE[$cache_key]}"
+
+  # Filter to meetings on the same date. Zoom's dateGroup is human-readable
+  # (e.g. "Wed, Apr 30") so we convert our MM/DD/YYYY to match.
+  local target_date_label
+  target_date_label=$(date -j -f "%m/%d/%Y" "$date" "+%a, %b %-d" 2>/dev/null) || \
+    target_date_label=$(date -d "$date" "+%a, %b %-d" 2>/dev/null) || target_date_label=""
+  local today_label
+  today_label=$(date "+%m/%d/%Y")
+
+  local clashes
+  clashes=$(printf '%s' "$cached" | jq -c \
+    --arg target "$target_date_label" \
+    --arg today "$today_label" \
+    --arg date "$date" \
+    '[.[] | select(
+      .timeRange != null and (
+        .dateGroup == $target or
+        ($date == $today and .dateGroup == "Today")
+      )
+    ) | {meetingId, topic, timeRange}]' 2>/dev/null) || clashes="[]"
+
+  printf '%s' "$clashes"
+}
+
+# ─── Delete helpers ───────────────────────────────────────────────────
+
+# generate_delete_token — generate a UUID token, store it with expiry, return it.
+# Usage: token=$(generate_delete_token "$meeting_id")
+generate_delete_token() {
+  local meeting_id="$1"
+
+  # Prune expired tokens to prevent unbounded growth from orphaned step-1 calls
+  local _tk _now
+  _now=$(date +%s)
+  for _tk in "${!_DELETE_TOKEN_EXPIRY[@]}"; do
+    if (( _now > _DELETE_TOKEN_EXPIRY[$_tk] )); then
+      unset '_DELETE_TOKENS[$_tk]'
+      unset '_DELETE_TOKEN_EXPIRY[$_tk]'
+    fi
+  done
+
+  local _raw_token
+  _raw_token=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null) || _raw_token=""
+  if [[ -z "$_raw_token" ]]; then
+    warn "generate_delete_token: failed to generate UUID"
+    return 1
+  fi
+  local expiry
+  expiry=$(( _now + 60 ))
+  # Assign to arrays in current shell (NOT via command substitution) so state persists.
+  _DELETE_TOKENS["$_raw_token"]="$meeting_id"
+  _DELETE_TOKEN_EXPIRY["$_raw_token"]="$expiry"
+  # Return token via global variable to avoid subshell call site.
+  _GENERATED_TOKEN="$_raw_token"
+}
+
+# validate_delete_token — returns 0 if valid, 1 if invalid/expired/wrong meeting.
+# Consumes the token on success (one-time use).
+# Usage: validate_delete_token "$token" "$meeting_id"
+validate_delete_token() {
+  local token="$1" meeting_id="$2"
+
+  # Token must exist
+  if [[ -z "${_DELETE_TOKENS[$token]+_}" ]]; then
+    return 1
+  fi
+
+  # Token must map to the correct meeting
+  if [[ "${_DELETE_TOKENS[$token]}" != "$meeting_id" ]]; then
+    return 1
+  fi
+
+  # Token must not be expired
+  local now expiry
+  now=$(date +%s)
+  expiry="${_DELETE_TOKEN_EXPIRY[$token]:-0}"
+  if (( now > expiry )); then
+    unset '_DELETE_TOKENS[$token]'
+    unset '_DELETE_TOKEN_EXPIRY[$token]'
+    return 1
+  fi
+
+  # Consume the token (one-time use)
+  unset '_DELETE_TOKENS[$token]'
+  unset '_DELETE_TOKEN_EXPIRY[$token]'
+  return 0
+}
+
+# check_delete_rate_limit — prune old timestamps, return 0 if under limit, 1 if over.
+check_delete_rate_limit() {
+  local now
+  now=$(date +%s)
+  local cutoff=$(( now - 60 ))
+
+  # Prune timestamps older than 60 seconds
+  local pruned=()
+  local ts
+  for ts in "${_DELETE_TIMESTAMPS[@]}"; do
+    (( ts > cutoff )) && pruned+=("$ts")
+  done
+  _DELETE_TIMESTAMPS=("${pruned[@]+"${pruned[@]}"}")
+
+  # Check count
+  if (( ${#_DELETE_TIMESTAMPS[@]} >= 6 )); then
+    return 1
+  fi
+  return 0
+}
+
+# record_delete_timestamp — append current epoch to _DELETE_TIMESTAMPS.
+record_delete_timestamp() {
+  _DELETE_TIMESTAMPS+=("$(date +%s)")
+}
 
 # ─── JSON-RPC helpers ─────────────────────────────────────────────────
 
@@ -167,6 +479,55 @@ handle_tools_list() {
           "required":[],
           "additionalProperties":false
         }
+      },
+      {
+        "name":"zoom_update",
+        "description":"Update an existing Zoom meeting. Provide the meeting ID and any fields to change. Returns updated status and any scheduling clashes if date/time changed.",
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "meetingId":{"type":"string","pattern":"^[0-9]+$","description":"Numeric meeting ID to update."},
+            "topic":{"type":"string","maxLength":200,"description":"New meeting topic."},
+            "date":{"type":"string","pattern":"^[0-9]{2}/[0-9]{2}/[0-9]{4}$","description":"New date (MM/DD/YYYY)."},
+            "time":{"type":"string","pattern":"^[0-9]{1,2}:[0-9]{2}$","description":"New time (H:MM or HH:MM)."},
+            "ampm":{"type":"string","enum":["AM","PM"],"description":"AM or PM."},
+            "duration_hr":{"type":"integer","minimum":0,"maximum":24,"description":"Duration hours component."},
+            "duration_min":{"type":"integer","minimum":0,"maximum":59,"description":"Duration minutes component."}
+          },
+          "required":["meetingId"],
+          "additionalProperties":false
+        }
+      },
+      {
+        "name":"zoom_create",
+        "description":"Create a new Zoom meeting. Returns meeting ID, join URL, and any scheduling clashes detected.",
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "topic":{"type":"string","description":"Meeting topic/title.","maxLength":200},
+            "date":{"type":"string","pattern":"^[0-9]{2}/[0-9]{2}/[0-9]{4}$","description":"Start date in MM/DD/YYYY format."},
+            "time":{"type":"string","pattern":"^[0-9]{1,2}:[0-9]{2}$","description":"Start time in H:MM or HH:MM format."},
+            "ampm":{"type":"string","enum":["AM","PM"],"default":"PM","description":"AM or PM."},
+            "duration":{"type":"integer","minimum":1,"maximum":1440,"default":60,"description":"Duration in minutes."},
+            "timezone":{"type":"string","default":"Europe/London","description":"IANA timezone."},
+            "invitees":{"type":"array","items":{"type":"string"},"description":"Email addresses of invitees."}
+          },
+          "required":["topic","date","time"],
+          "additionalProperties":false
+        }
+      },
+      {
+        "name":"zoom_delete",
+        "description":"Delete a Zoom meeting. Uses two-step confirmation: first call returns meeting details and a confirmation token, second call with the token executes the deletion. Tokens expire after 60 seconds and can only be used once. Rate limited to 6 deletions per minute.",
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "meetingId":{"type":"string","pattern":"^[0-9]+$","description":"Numeric meeting ID to delete."},
+            "confirmToken":{"type":"string","description":"Confirmation token from step 1. Omit for step 1 (get meeting details + token)."}
+          },
+          "required":["meetingId"],
+          "additionalProperties":false
+        }
       }
     ]
   }'
@@ -182,6 +543,9 @@ handle_tools_call() {
     zoom_list)          tool_zoom_list "$id" "$line" ;;
     zoom_view)          tool_zoom_view "$id" "$line" ;;
     initialize_session) tool_initialize_session "$id" "$line" ;;
+    zoom_create)        tool_zoom_create "$id" "$line" ;;
+    zoom_update)        tool_zoom_update "$id" "$line" ;;
+    zoom_delete)        tool_zoom_delete "$id" "$line" ;;
     *)
       send_tool_error "$id" "BAD_INPUT" "Unknown tool: ${tool_name:-<empty>}" false
       ;;
@@ -403,6 +767,432 @@ tool_initialize_session() {
   rm -f "${SCRIPT_DIR}/.csrf_token"
 
   send_tool_result "$id" '{"ok":true,"data":{"status":"session_ready"}}'
+}
+
+tool_zoom_create() {
+  local id="$1" line="$2"
+
+  # 1. Check writes enabled
+
+  # 2. Parse each input individually to avoid IFS/tsv empty-field collapsing issues
+  local topic date time ampm duration timezone invitees_csv
+  topic=$(printf '%s' "$line" | jq -r '.params.arguments.topic // ""' 2>/dev/null) || true
+  date=$(printf '%s' "$line" | jq -r '.params.arguments.date // ""' 2>/dev/null) || true
+  time=$(printf '%s' "$line" | jq -r '.params.arguments.time // ""' 2>/dev/null) || true
+  ampm=$(printf '%s' "$line" | jq -r '.params.arguments.ampm // "PM"' 2>/dev/null) || true
+  duration=$(printf '%s' "$line" | jq -r '.params.arguments.duration // 60 | tostring' 2>/dev/null) || true
+  timezone=$(printf '%s' "$line" | jq -r '.params.arguments.timezone // "Europe/London"' 2>/dev/null) || true
+  invitees_csv=$(printf '%s' "$line" | jq -r '(.params.arguments.invitees // []) | join(",")' 2>/dev/null) || true
+
+  # 3. Validate required fields
+  if ! validate_topic "$topic"; then
+    send_tool_error "$id" "BAD_INPUT" "topic is required and must be at most 200 characters." false
+    return
+  fi
+
+  if ! validate_date "$date"; then
+    send_tool_error "$id" "BAD_INPUT" "date must be in MM/DD/YYYY format (got: ${date:0:50})." false
+    return
+  fi
+
+  if ! validate_time "$time"; then
+    send_tool_error "$id" "BAD_INPUT" "time must be in H:MM or HH:MM format (got: ${time:0:20})." false
+    return
+  fi
+
+  if ! validate_ampm "$ampm"; then
+    send_tool_error "$id" "BAD_INPUT" "ampm must be AM or PM (got: ${ampm:0:10})." false
+    return
+  fi
+
+  if ! validate_duration "$duration"; then
+    send_tool_error "$id" "BAD_INPUT" "duration must be an integer between 1 and 1440 (got: ${duration:0:10})." false
+    return
+  fi
+
+  # Validate each invitee email if provided
+  if [[ -n "$invitees_csv" ]]; then
+    IFS=',' read -ra _invitee_list <<< "$invitees_csv"
+    for _email in "${_invitee_list[@]}"; do
+      _email="${_email# }"; _email="${_email% }"  # trim spaces
+      if ! validate_email "$_email"; then
+        send_tool_error "$id" "BAD_INPUT" "Invalid invitee email address: ${_email:0:100}" false
+        return
+      fi
+    done
+  fi
+
+  # 4. Audit create_attempt
+  local audit_details
+  audit_details=$(jq -cn --arg topic "$topic" --arg date "$date" --arg time "$time" --arg ampm "$ampm" \
+    '{topic:$topic, date:$date, time:$time, ampm:$ampm}') || audit_details='{}'
+  audit_log "create_attempt" "" "$audit_details"
+
+  # 5. Build payload: pipe JSON args to build_create_payload
+  local payload
+  payload=$(jq -cn \
+    --arg topic      "$topic" \
+    --arg date       "$date" \
+    --arg time       "$time" \
+    --arg ampm       "$ampm" \
+    --argjson duration "$duration" \
+    --arg timezone   "$timezone" \
+    --arg invitees   "$invitees_csv" \
+    '{topic:$topic, agenda:"", date:$date, time:$time, ampm:$ampm, duration:$duration, timezone:$timezone, invitees:$invitees, recurring:false, recurrence_type:"", recurrence_interval:"1", recurrence_end:"", recurrence_days:""}' \
+    | build_create_payload 2>/dev/null) || true
+
+  if [[ -z "$payload" ]]; then
+    audit_log "create_failure" "" '{"reason":"payload_build_failed"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Failed to build meeting creation payload." false
+    return
+  fi
+
+  # 6. Call Zoom API
+  local response
+  response=$(zoom_post_json "/rest/meeting/save" "$payload" 2>/dev/null) || true
+
+  if [[ -z "$response" ]]; then
+    audit_log "create_failure" "" '{"reason":"empty_api_response"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+    return
+  fi
+
+  # 7. Check auth expiry
+  if is_auth_expired "$response"; then
+    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." false
+    return
+  fi
+
+  # Check API-level error
+  local status
+  status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+  if [[ "$status" != "true" ]]; then
+    local error_msg
+    error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Unknown API error"' 2>/dev/null) || true
+    audit_log "create_failure" "" "$(jq -cn --arg reason "$error_msg" '{reason:$reason}')"
+    send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+    return
+  fi
+
+  # 8. Extract meetingId and joinUrl from response
+  local meeting_id join_url
+  meeting_id=$(printf '%s' "$response" | jq -r '(.result.mn // .result.meetingNumber // "") | tostring' 2>/dev/null) || true
+  join_url=$(printf '%s' "$response" | jq -r '.result.joinLink // .result.joinUrl // ""' 2>/dev/null) || true
+
+  if [[ -z "$meeting_id" || "$meeting_id" == "null" || "$meeting_id" == "" ]]; then
+    audit_log "create_failure" "" '{"reason":"missing_meeting_id_in_response"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Meeting created but could not extract meeting ID from response." false
+    return
+  fi
+
+  # 9. Run detect_clashes and append new meeting to cache
+  local clashes
+  clashes=$(detect_clashes "$date" "$time" "$ampm" "$duration") || clashes="[]"
+
+  # Append new meeting to clash cache
+  local cache_key
+  cache_key=$(_clash_cache_key "$date") || true
+  if [[ -n "$cache_key" ]]; then
+    local new_meeting_json
+    new_meeting_json=$(jq -cn --arg mid "$meeting_id" --arg topic "$topic" \
+      '{meetingId:$mid, topic:$topic, timeRange:null}') || true
+    [[ -n "$new_meeting_json" ]] && append_to_clash_cache "$cache_key" "$new_meeting_json"
+  fi
+
+  # 10. Audit success
+  local clashes_count
+  clashes_count=$(printf '%s' "$clashes" | jq 'length' 2>/dev/null) || clashes_count=0
+  audit_log "create_success" "$meeting_id" \
+    "$(jq -cn --arg url "$join_url" --argjson n "$clashes_count" '{joinUrl:$url, clashes_count:$n}')"
+
+  # 11. Return result
+  local result
+  result=$(jq -cn \
+    --arg mid     "$meeting_id" \
+    --arg url     "$join_url" \
+    --arg topic   "$topic" \
+    --argjson clashes "$clashes" \
+    '{ok:true, data:{meetingId:$mid, joinUrl:$url, topic:$topic, clashes:$clashes}}')
+  send_tool_result "$id" "$result"
+}
+
+tool_zoom_update() {
+  local id="$1" line="$2"
+
+  # 1. Check writes enabled
+
+  # 2. Parse each input individually to avoid IFS/tsv empty-field collapsing issues
+  local meeting_id topic date time ampm duration_hr duration_min
+  meeting_id=$(printf '%s' "$line" | jq -r '.params.arguments.meetingId // ""' 2>/dev/null) || true
+  topic=$(printf '%s' "$line" | jq -r '.params.arguments.topic // ""' 2>/dev/null) || true
+  date=$(printf '%s' "$line" | jq -r '.params.arguments.date // ""' 2>/dev/null) || true
+  time=$(printf '%s' "$line" | jq -r '.params.arguments.time // ""' 2>/dev/null) || true
+  ampm=$(printf '%s' "$line" | jq -r '.params.arguments.ampm // ""' 2>/dev/null) || true
+  duration_hr=$(printf '%s' "$line" | jq -r '.params.arguments.duration_hr // "" | tostring' 2>/dev/null) || true
+  duration_min=$(printf '%s' "$line" | jq -r '.params.arguments.duration_min // "" | tostring' 2>/dev/null) || true
+  # Normalise jq "null" strings to empty
+  [[ "$duration_hr"  == "null" ]] && duration_hr=""
+  [[ "$duration_min" == "null" ]] && duration_min=""
+
+  # 3. Validate meetingId (required)
+  if ! validate_meeting_id "$meeting_id"; then
+    send_tool_error "$id" "BAD_INPUT" "meetingId is required and must be numeric (got: ${meeting_id:0:50})." false
+    return
+  fi
+
+  # Validate optional fields only when provided
+  if [[ -n "$topic" ]] && [[ ${#topic} -gt 200 ]]; then
+    send_tool_error "$id" "BAD_INPUT" "topic must be at most 200 characters." false
+    return
+  fi
+
+  if [[ -n "$date" ]] && ! validate_date "$date"; then
+    send_tool_error "$id" "BAD_INPUT" "date must be in MM/DD/YYYY format (got: ${date:0:50})." false
+    return
+  fi
+
+  if [[ -n "$time" ]] && ! validate_time "$time"; then
+    send_tool_error "$id" "BAD_INPUT" "time must be in H:MM or HH:MM format (got: ${time:0:20})." false
+    return
+  fi
+
+  if [[ -n "$ampm" ]] && ! validate_ampm "$ampm"; then
+    send_tool_error "$id" "BAD_INPUT" "ampm must be AM or PM (got: ${ampm:0:10})." false
+    return
+  fi
+
+  # 4. Require at least one update field
+  if [[ -z "$topic" && -z "$date" && -z "$time" && -z "$ampm" && -z "$duration_hr" && -z "$duration_min" ]]; then
+    send_tool_error "$id" "BAD_INPUT" "At least one field to update is required." false
+    return
+  fi
+
+  # 5. Audit update_attempt with fields being changed
+  local audit_fields
+  audit_fields=$(jq -cn \
+    --arg mid "$meeting_id" \
+    --arg topic "$topic" \
+    --arg date "$date" \
+    --arg time "$time" \
+    --arg ampm "$ampm" \
+    --arg duration_hr "$duration_hr" \
+    --arg duration_min "$duration_min" \
+    '{meetingId:$mid, fields_changed:{topic:$topic, date:$date, time:$time, ampm:$ampm, duration_hr:$duration_hr, duration_min:$duration_min}}') || audit_fields="{}"
+  audit_log "update_attempt" "$meeting_id" "$audit_fields"
+
+  # 6. Pre-write snapshot
+  local snapshot
+  snapshot=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || snapshot="{}"
+  local snapshot_safe
+  snapshot_safe=$(printf '%s' "$snapshot" | jq -c '{topic:(.result.meeting.topic.value // null), startDate:(.result.meeting.startDate.value // null), startTime:(.result.meeting.startTime.value // null), duration:(.result.meeting.duration.value // null)}' 2>/dev/null) || snapshot_safe='{}'
+  audit_log "update_snapshot" "$meeting_id" "$snapshot_safe"
+
+  # 7. Build form params for update API call
+  local params=()
+  [[ -n "$topic" ]]       && params+=("topic=${topic}")
+  [[ -n "$date" ]]        && params+=("startDate=${date}")
+  [[ -n "$time" ]]        && params+=("startTime=${time}")
+  [[ -n "$ampm" ]]        && params+=("startTime2=${ampm}")
+
+  if [[ -n "$duration_hr" || -n "$duration_min" ]]; then
+    local hr="${duration_hr:-0}" min="${duration_min:-0}"
+    # strip trailing .0 from jq tostring output
+    hr="${hr%%.*}"; min="${min%%.*}"
+    local total_minutes=$(( hr * 60 + min ))
+    params+=("duration=${total_minutes}")
+  fi
+
+  # 8. Call Zoom update API
+  local response
+  response=$(zoom_post "/rest/meeting/save?meetingNumber=${meeting_id}" "${params[@]}" 2>/dev/null) || true
+
+  if [[ -z "$response" ]]; then
+    audit_log "update_failure" "$meeting_id" '{"reason":"empty_api_response"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+    return
+  fi
+
+  # 9. Check auth expiry / API error
+  if is_auth_expired "$response"; then
+    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." false
+    return
+  fi
+
+  local status
+  status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+  if [[ "$status" != "true" ]]; then
+    local error_msg
+    error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Unknown API error"' 2>/dev/null) || true
+    audit_log "update_failure" "$meeting_id" "$(jq -cn --arg reason "$error_msg" '{reason:$reason}')"
+    send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+    return
+  fi
+
+  # 10. If date or time changed, run detect_clashes and append to cache
+  local clashes="[]"
+  if [[ -n "$date" || -n "$time" ]]; then
+    # Use provided date/time; fall back to values from snapshot if only one was changed
+    local clash_date clash_time clash_ampm clash_duration
+    clash_date="$date"
+    clash_time="$time"
+    clash_ampm="${ampm:-PM}"
+
+    # Compute duration in minutes for clash detection
+    if [[ -n "$duration_hr" || -n "$duration_min" ]]; then
+      local hr="${duration_hr:-0}" min="${duration_min:-0}"
+      hr="${hr%%.*}"; min="${min%%.*}"
+      clash_duration=$(( hr * 60 + min ))
+    else
+      clash_duration=60
+    fi
+
+    if [[ -n "$clash_date" && -n "$clash_time" ]]; then
+      clashes=$(detect_clashes "$clash_date" "$clash_time" "$clash_ampm" "$clash_duration") || clashes="[]"
+
+      # Append updated meeting to clash cache
+      local cache_key
+      cache_key=$(_clash_cache_key "$clash_date") || true
+      if [[ -n "$cache_key" ]]; then
+        local updated_meeting_json
+        updated_meeting_json=$(jq -cn --arg mid "$meeting_id" --arg t "$topic" \
+          '{meetingId:$mid, topic:$t, timeRange:null}') || true
+        [[ -n "$updated_meeting_json" ]] && append_to_clash_cache "$cache_key" "$updated_meeting_json"
+      fi
+    fi
+  fi
+
+  # 11. Audit success
+  local clashes_count
+  clashes_count=$(printf '%s' "$clashes" | jq 'length' 2>/dev/null) || clashes_count=0
+  audit_log "update_success" "$meeting_id" \
+    "$(jq -cn --argjson n "$clashes_count" '{clashes_count:$n}')"
+
+  # 12. Return result
+  local result
+  result=$(jq -cn \
+    --arg mid    "$meeting_id" \
+    --argjson clashes "$clashes" \
+    '{ok:true, data:{meetingId:$mid, status:"updated", clashes:$clashes}}')
+  send_tool_result "$id" "$result"
+}
+
+tool_zoom_delete() {
+  local id="$1" line="$2"
+
+
+  # Parse inputs
+  local meeting_id confirm_token
+  meeting_id=$(printf '%s' "$line" | jq -r '.params.arguments.meetingId // ""' 2>/dev/null) || true
+  confirm_token=$(printf '%s' "$line" | jq -r '.params.arguments.confirmToken // ""' 2>/dev/null) || true
+
+  # Validate meetingId
+  if ! validate_meeting_id "$meeting_id"; then
+    send_tool_error "$id" "BAD_INPUT" "meetingId is required and must be numeric." false
+    return
+  fi
+
+  if [[ -z "$confirm_token" ]]; then
+    # ─── Step 1: Get meeting details + generate token ───
+
+    # Existence check via zoom_post /rest/meeting/view
+    local response
+    response=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || true
+
+    if [[ -z "$response" ]]; then
+      send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+      return
+    fi
+
+    if is_auth_expired "$response"; then
+      send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call initialize_session." false
+      return
+    fi
+
+    local status
+    status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+    if [[ "$status" != "true" ]]; then
+      local error_msg
+      error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Meeting not found"' 2>/dev/null) || true
+      send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+      return
+    fi
+
+    # Extract topic for confirmation
+    local topic
+    topic=$(printf '%s' "$response" | jq -r '.result.meeting.topic.value // "Unknown"' 2>/dev/null) || true
+
+    # Generate token — call directly (not via $()) so array state is preserved in this shell.
+    _GENERATED_TOKEN=""
+    generate_delete_token "$meeting_id" || { send_tool_error "$id" "INTERNAL_ERROR" "Failed to generate confirmation token." false; return; }
+    local token="$_GENERATED_TOKEN"
+
+    audit_log "delete_token_issued" "$meeting_id" "$(jq -cn --arg topic "$topic" '{topic:$topic}')"
+
+    # Return confirmation prompt
+    local result
+    result=$(jq -cn \
+      --arg mid "$meeting_id" \
+      --arg topic "$topic" \
+      --arg token "$token" \
+      '{ok:true, data:{action:"confirm_required", meetingId:$mid, topic:$topic, confirmToken:$token, message:"To confirm deletion, call zoom_delete again with this confirmToken. Token expires in 60 seconds."}}')
+    send_tool_result "$id" "$result"
+
+  else
+    # ─── Step 2: Validate token and delete ───
+
+    # Validate token
+    if ! validate_delete_token "$confirm_token" "$meeting_id"; then
+      send_tool_error "$id" "BAD_INPUT" "Invalid, expired, or already-used confirmation token." false
+      return
+    fi
+
+    # Check rate limit
+    if ! check_delete_rate_limit; then
+      send_tool_error "$id" "RATE_LIMITED" "Delete rate limit exceeded (max 6 per minute). Please wait." false
+      return
+    fi
+
+    # Pre-write snapshot
+    local snapshot
+    snapshot=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || snapshot="{}"
+    local snapshot_safe
+    snapshot_safe=$(printf '%s' "$snapshot" | jq -c '{topic:(.result.meeting.topic.value // null), startDate:(.result.meeting.startDate.value // null)}' 2>/dev/null) || snapshot_safe='{}'
+    audit_log "delete_snapshot" "$meeting_id" "$snapshot_safe"
+
+    # Execute delete
+    local response
+    response=$(zoom_post "/meeting/delete" "id=${meeting_id}" "sendMail=false" 2>/dev/null) || true
+
+    if [[ -z "$response" ]]; then
+      audit_log "delete_failure" "$meeting_id" '{"reason":"empty_api_response"}'
+      send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+      return
+    fi
+
+    if is_auth_expired "$response"; then
+      send_tool_error "$id" "AUTH_EXPIRED" "Session expired." false
+      return
+    fi
+
+    local status
+    status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+    if [[ "$status" != "true" ]]; then
+      local error_msg
+      error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Delete failed"' 2>/dev/null) || true
+      audit_log "delete_failure" "$meeting_id" "$(jq -cn --arg reason "$error_msg" '{reason:$reason}')"
+      send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+      return
+    fi
+
+    # Record timestamp for rate limiting
+    record_delete_timestamp
+
+    audit_log "delete_success" "$meeting_id" '{}'
+
+    local result
+    result=$(jq -cn --arg mid "$meeting_id" '{ok:true, data:{meetingId:$mid, status:"deleted"}}')
+    send_tool_result "$id" "$result"
+  fi
 }
 
 # ─── Main loop ────────────────────────────────────────────────────────
