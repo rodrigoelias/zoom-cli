@@ -387,6 +387,24 @@ handle_tools_list() {
         }
       },
       {
+        "name":"zoom_update",
+        "description":"Update an existing Zoom meeting. Provide the meeting ID and any fields to change. Returns updated status and any scheduling clashes if date/time changed.",
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "meetingId":{"type":"string","pattern":"^[0-9]+$","description":"Numeric meeting ID to update."},
+            "topic":{"type":"string","maxLength":200,"description":"New meeting topic."},
+            "date":{"type":"string","pattern":"^[0-9]{2}/[0-9]{2}/[0-9]{4}$","description":"New date (MM/DD/YYYY)."},
+            "time":{"type":"string","pattern":"^[0-9]{1,2}:[0-9]{2}$","description":"New time (H:MM or HH:MM)."},
+            "ampm":{"type":"string","enum":["AM","PM"],"description":"AM or PM."},
+            "duration_hr":{"type":"integer","minimum":0,"maximum":24,"description":"Duration hours component."},
+            "duration_min":{"type":"integer","minimum":0,"maximum":59,"description":"Duration minutes component."}
+          },
+          "required":["meetingId"],
+          "additionalProperties":false
+        }
+      },
+      {
         "name":"zoom_create",
         "description":"Create a new Zoom meeting. Returns meeting ID, join URL, and any scheduling clashes detected.",
         "inputSchema":{
@@ -419,6 +437,7 @@ handle_tools_call() {
     zoom_view)          tool_zoom_view "$id" "$line" ;;
     initialize_session) tool_initialize_session "$id" "$line" ;;
     zoom_create)        tool_zoom_create "$id" "$line" ;;
+    zoom_update)        tool_zoom_update "$id" "$line" ;;
     *)
       send_tool_error "$id" "BAD_INPUT" "Unknown tool: ${tool_name:-<empty>}" false
       ;;
@@ -801,6 +820,176 @@ tool_zoom_create() {
     --arg topic   "$topic" \
     --argjson clashes "$clashes" \
     '{ok:true, data:{meetingId:$mid, joinUrl:$url, topic:$topic, clashes:$clashes}}')
+  send_tool_result "$id" "$result"
+}
+
+tool_zoom_update() {
+  local id="$1" line="$2"
+
+  # 1. Check writes enabled
+  check_writes_enabled "$id" || return
+
+  # 2. Parse all inputs in a single jq call
+  local meeting_id topic date time ampm duration_hr duration_min
+  read -r meeting_id topic date time ampm duration_hr duration_min < <(printf '%s' "$line" | jq -r \
+    '[
+      (.params.arguments.meetingId // ""),
+      (.params.arguments.topic // ""),
+      (.params.arguments.date // ""),
+      (.params.arguments.time // ""),
+      (.params.arguments.ampm // ""),
+      (.params.arguments.duration_hr // "" | tostring),
+      (.params.arguments.duration_min // "" | tostring)
+    ] | @tsv' 2>/dev/null) || true
+
+  # 3. Validate meetingId (required)
+  if ! validate_meeting_id "$meeting_id"; then
+    send_tool_error "$id" "BAD_INPUT" "meetingId is required and must be numeric (got: ${meeting_id:0:50})." false
+    return
+  fi
+
+  # Validate optional fields only when provided
+  if [[ -n "$topic" ]] && [[ ${#topic} -gt 200 ]]; then
+    send_tool_error "$id" "BAD_INPUT" "topic must be at most 200 characters." false
+    return
+  fi
+
+  if [[ -n "$date" ]] && ! validate_date "$date"; then
+    send_tool_error "$id" "BAD_INPUT" "date must be in MM/DD/YYYY format (got: ${date:0:50})." false
+    return
+  fi
+
+  if [[ -n "$time" ]] && ! validate_time "$time"; then
+    send_tool_error "$id" "BAD_INPUT" "time must be in H:MM or HH:MM format (got: ${time:0:20})." false
+    return
+  fi
+
+  if [[ -n "$ampm" ]] && ! validate_ampm "$ampm"; then
+    send_tool_error "$id" "BAD_INPUT" "ampm must be AM or PM (got: ${ampm:0:10})." false
+    return
+  fi
+
+  # 4. Require at least one update field
+  if [[ -z "$topic" && -z "$date" && -z "$time" && -z "$ampm" && -z "$duration_hr" && -z "$duration_min" ]]; then
+    send_tool_error "$id" "BAD_INPUT" "At least one field to update is required." false
+    return
+  fi
+
+  # 5. Audit update_attempt with fields being changed
+  local audit_fields
+  audit_fields=$(jq -cn \
+    --arg mid "$meeting_id" \
+    --arg topic "$topic" \
+    --arg date "$date" \
+    --arg time "$time" \
+    --arg ampm "$ampm" \
+    --arg duration_hr "$duration_hr" \
+    --arg duration_min "$duration_min" \
+    '{meetingId:$mid, fields_changed:{topic:$topic, date:$date, time:$time, ampm:$ampm, duration_hr:$duration_hr, duration_min:$duration_min}}') || audit_fields="{}"
+  audit_log "update_attempt" "$meeting_id" "$audit_fields"
+
+  # 6. Pre-write snapshot
+  local snapshot
+  snapshot=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || snapshot="{}"
+  audit_log "update_snapshot" "$meeting_id" "${snapshot:-{}}"
+
+  # 7. Build form params for update API call
+  local params=()
+  [[ -n "$topic" ]]       && params+=("topic=${topic}")
+  [[ -n "$date" ]]        && params+=("startDate=${date}")
+  [[ -n "$time" ]]        && params+=("startTime=${time}")
+  [[ -n "$ampm" ]]        && params+=("startTime2=${ampm}")
+
+  if [[ -n "$duration_hr" || -n "$duration_min" ]]; then
+    local hr="${duration_hr:-0}" min="${duration_min:-0}"
+    # strip trailing .0 from jq tostring output
+    hr="${hr%%.*}"; min="${min%%.*}"
+    local total_minutes=$(( hr * 60 + min ))
+    params+=("duration=${total_minutes}")
+  fi
+
+  # 8. Call Zoom update API
+  local response
+  response=$(zoom_post "/rest/meeting/save?meetingNumber=${meeting_id}" "${params[@]}" 2>/dev/null) || true
+
+  if [[ -z "$response" ]]; then
+    audit_log "update_failure" "$meeting_id" '{"reason":"empty_api_response"}'
+    send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+    return
+  fi
+
+  # 9. Check auth expiry / API error
+  if is_auth_expired "$response"; then
+    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." false
+    return
+  fi
+
+  local status
+  status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+  if [[ "$status" != "true" ]]; then
+    local error_msg
+    error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Unknown API error"' 2>/dev/null) || true
+    audit_log "update_failure" "$meeting_id" "$(jq -cn --arg reason "$error_msg" '{reason:$reason}')"
+    send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+    return
+  fi
+
+  # 10. If date or time changed, run detect_clashes and append to cache
+  local clashes="[]"
+  if [[ -n "$date" || -n "$time" ]]; then
+    # Use provided date/time; fall back to values from snapshot if only one was changed
+    local clash_date clash_time clash_ampm clash_duration
+    clash_date="$date"
+    clash_time="$time"
+    clash_ampm="${ampm:-PM}"
+
+    # Compute duration in minutes for clash detection
+    if [[ -n "$duration_hr" || -n "$duration_min" ]]; then
+      local hr="${duration_hr:-0}" min="${duration_min:-0}"
+      hr="${hr%%.*}"; min="${min%%.*}"
+      clash_duration=$(( hr * 60 + min ))
+    else
+      clash_duration=60
+    fi
+
+    if [[ -n "$clash_date" && -n "$clash_time" ]]; then
+      clashes=$(detect_clashes "$clash_date" "$clash_time" "$clash_ampm" "$clash_duration") || clashes="[]"
+
+      # Append updated meeting to clash cache
+      local target_epoch
+      target_epoch=$(date -j -f "%m/%d/%Y" "$clash_date" "+%s" 2>/dev/null) || \
+        target_epoch=$(date -d "$clash_date" "+%s" 2>/dev/null) || target_epoch=""
+
+      if [[ -n "$target_epoch" ]]; then
+        local range_start range_end fmt_start fmt_end
+        range_start=$(( target_epoch - 7 * 86400 ))
+        range_end=$(( target_epoch + 14 * 86400 ))
+        fmt_start=$(date -r "$range_start" "+%Y-%m-%d" 2>/dev/null) || \
+          fmt_start=$(date -d "@${range_start}" "+%Y-%m-%d" 2>/dev/null) || fmt_start=""
+        fmt_end=$(date -r "$range_end" "+%Y-%m-%d" 2>/dev/null) || \
+          fmt_end=$(date -d "@${range_end}" "+%Y-%m-%d" 2>/dev/null) || fmt_end=""
+        local cache_key="${fmt_start}:${fmt_end}"
+
+        local updated_meeting_json
+        updated_meeting_json=$(jq -cn --arg mid "$meeting_id" --arg t "$topic" \
+          '{meetingId:$mid, topic:$t, timeRange:null}') || true
+        [[ -n "$updated_meeting_json" ]] && append_to_clash_cache "$cache_key" "$updated_meeting_json"
+      fi
+    fi
+  fi
+
+  # 11. Audit success
+  local clashes_count
+  clashes_count=$(printf '%s' "$clashes" | jq 'length' 2>/dev/null) || clashes_count=0
+  audit_log "update_success" "$meeting_id" \
+    "$(jq -cn --argjson n "$clashes_count" '{clashes_count:$n}')"
+
+  # 12. Return result
+  local result
+  result=$(jq -cn \
+    --arg mid    "$meeting_id" \
+    --argjson clashes "$clashes" \
+    '{ok:true, data:{meetingId:$mid, status:"updated", clashes:$clashes}}')
   send_tool_result "$id" "$result"
 }
 
