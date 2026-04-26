@@ -74,12 +74,12 @@ trap cleanup EXIT
 # Uses mock curl and mock node via PATH injection
 run_mcp() {
   local input="$1"
-  printf '%s\n' "$input" | PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
+  printf '%s\n' "$input" | ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
 }
 
 # Helper: send multiple messages
 run_mcp_multi() {
-  PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
+  ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null
 }
 
 # Setup mock curl with a canned response
@@ -471,7 +471,7 @@ setup_mock_curl '{"status":true,"errorCode":0,"result":{"meeting":{"topic":{"val
 _ts_fifo="${MOCK_DIR}/ts_fifo_$$"
 _ts_out="${MOCK_DIR}/ts_out_$$"
 mkfifo "$_ts_fifo"
-PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ts_fifo" > "$_ts_out" 2>/dev/null &
+ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ts_fifo" > "$_ts_out" 2>/dev/null &
 _ts_pid=$!
 exec 7>"$_ts_fifo"
 # Step 1
@@ -503,7 +503,7 @@ setup_mock_curl '{"status":true,"errorCode":0,"result":{"meeting":{"topic":{"val
 _ru_fifo="${MOCK_DIR}/ru_fifo_$$"
 _ru_out="${MOCK_DIR}/ru_out_$$"
 mkfifo "$_ru_fifo"
-PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ru_fifo" > "$_ru_out" 2>/dev/null &
+ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_ru_fifo" > "$_ru_out" 2>/dev/null &
 _ru_pid=$!
 exec 7>"$_ru_fifo"
 # Step 1 — get token
@@ -570,7 +570,7 @@ _rl_fifo="${MOCK_DIR}/rl_fifo_$$"
 _rl_outfile="${MOCK_DIR}/rl_out_$$"
 mkfifo "$_rl_fifo"
 
-PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_rl_fifo" > "$_rl_outfile" 2>/dev/null &
+ZOOM_CLI_WRITES_ENABLED=true PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" < "$_rl_fifo" > "$_rl_outfile" 2>/dev/null &
 _rl_pid=$!
 exec 8>"$_rl_fifo"
 

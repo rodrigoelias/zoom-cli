@@ -97,7 +97,7 @@ trap 'echo "SIGPIPE: client disconnected" >&2; exit 0' PIPE
 # Callers must pass $id so a JSON-RPC error can be sent before returning 1.
 check_writes_enabled() {
   local id="$1"
-  local enabled="${ZOOM_CLI_WRITES_ENABLED:-true}"
+  local enabled="${ZOOM_CLI_WRITES_ENABLED:-false}"
   if [[ "$enabled" != "true" ]]; then
     send_tool_error "$id" "WRITES_DISABLED" \
       "Write operations are disabled. Set ZOOM_CLI_WRITES_ENABLED=true to enable." false
@@ -241,9 +241,6 @@ detect_clashes() {
 
   # Build a date range key: target week + following week
   # We fetch two weeks of meetings to catch edge cases near week boundaries.
-  local today_epoch
-  today_epoch=$(date "+%s" 2>/dev/null || echo 0)
-
   # Derive startDate of the week containing our target date (Sunday-based)
   local target_epoch
   target_epoch=$(date -j -f "%m/%d/%Y" "$date" "+%s" 2>/dev/null) || \
@@ -271,18 +268,18 @@ detect_clashes() {
     local response
     response=$(zoom_post "/rest/meeting/list" "${params[@]}" 2>/dev/null) || true
 
-    # Extract flat list of meetings [{meetingId, topic, timeRange, startEpoch, endEpoch}]
+    # Extract flat list of meetings with their date group
     local flat_meetings
     flat_meetings=$(printf '%s' "$response" | jq -c '
       [
         (.result.meetings // [])[] |
+        .time as $date_group |
         (.list // [])[] |
         {
           meetingId: (.number | tostring),
           topic: .topic,
           timeRange: (.schTimeF // null),
-          _startEpoch: null,
-          _endEpoch: null
+          dateGroup: $date_group
         }
       ]
     ' 2>/dev/null) || flat_meetings="[]"
@@ -292,21 +289,25 @@ detect_clashes() {
 
   local cached="${_CLASH_CACHE[$cache_key]}"
 
-  # Find overlapping meetings.
-  # We can't easily parse the Zoom schTimeF string to epoch in pure jq/bash,
-  # so we compare using the numeric start_epoch we already have plus the
-  # duration embedded in schTimeF is not reliable. We use a conservative
-  # check: if any existing meeting's timeRange string is non-empty and
-  # the meeting is on the same date string, we flag it for caller review.
-  # For precise overlap, callers that have duration info should use their
-  # own epoch comparison; this provides a best-effort list.
-  #
-  # Practical approach: return all meetings on the same date as $date so
-  # the caller / LLM can decide.
+  # Filter to meetings on the same date. Zoom's dateGroup is human-readable
+  # (e.g. "Wed, Apr 30") so we convert our MM/DD/YYYY to match.
+  local target_date_label
+  target_date_label=$(date -j -f "%m/%d/%Y" "$date" "+%a, %b %-d" 2>/dev/null) || \
+    target_date_label=$(date -d "$date" "+%a, %b %-d" 2>/dev/null) || target_date_label=""
+  local today_label
+  today_label=$(date "+%m/%d/%Y")
+
   local clashes
   clashes=$(printf '%s' "$cached" | jq -c \
+    --arg target "$target_date_label" \
+    --arg today "$today_label" \
     --arg date "$date" \
-    '[.[] | select(.timeRange != null)]' 2>/dev/null) || clashes="[]"
+    '[.[] | select(
+      .timeRange != null and (
+        .dateGroup == $target or
+        ($date == $today and .dateGroup == "Today")
+      )
+    ) | {meetingId, topic, timeRange}]' 2>/dev/null) || clashes="[]"
 
   printf '%s' "$clashes"
 }
@@ -317,6 +318,17 @@ detect_clashes() {
 # Usage: token=$(generate_delete_token "$meeting_id")
 generate_delete_token() {
   local meeting_id="$1"
+
+  # Prune expired tokens to prevent unbounded growth from orphaned step-1 calls
+  local _tk _now
+  _now=$(date +%s)
+  for _tk in "${!_DELETE_TOKEN_EXPIRY[@]}"; do
+    if (( _now > _DELETE_TOKEN_EXPIRY[$_tk] )); then
+      unset '_DELETE_TOKENS[$_tk]'
+      unset '_DELETE_TOKEN_EXPIRY[$_tk]'
+    fi
+  done
+
   local _raw_token
   _raw_token=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null) || _raw_token=""
   if [[ -z "$_raw_token" ]]; then
@@ -324,7 +336,7 @@ generate_delete_token() {
     return 1
   fi
   local expiry
-  expiry=$(( $(date +%s) + 60 ))
+  expiry=$(( _now + 60 ))
   # Assign to arrays in current shell (NOT via command substitution) so state persists.
   _DELETE_TOKENS["$_raw_token"]="$meeting_id"
   _DELETE_TOKEN_EXPIRY["$_raw_token"]="$expiry"
@@ -992,7 +1004,9 @@ tool_zoom_update() {
   # 6. Pre-write snapshot
   local snapshot
   snapshot=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || snapshot="{}"
-  audit_log "update_snapshot" "$meeting_id" "${snapshot:-{}}"
+  local snapshot_safe
+  snapshot_safe=$(printf '%s' "$snapshot" | jq -c '{topic:(.result.meeting.topic.value // null), startDate:(.result.meeting.startDate.value // null), startTime:(.result.meeting.startTime.value // null), duration:(.result.meeting.duration.value // null)}' 2>/dev/null) || snapshot_safe='{}'
+  audit_log "update_snapshot" "$meeting_id" "$snapshot_safe"
 
   # 7. Build form params for update API call
   local params=()
@@ -1174,7 +1188,9 @@ tool_zoom_delete() {
     # Pre-write snapshot
     local snapshot
     snapshot=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || snapshot="{}"
-    audit_log "delete_snapshot" "$meeting_id" "${snapshot:-{}}"
+    local snapshot_safe
+    snapshot_safe=$(printf '%s' "$snapshot" | jq -c '{topic:(.result.meeting.topic.value // null), startDate:(.result.meeting.startDate.value // null)}' 2>/dev/null) || snapshot_safe='{}'
+    audit_log "delete_snapshot" "$meeting_id" "$snapshot_safe"
 
     # Execute delete
     local response
