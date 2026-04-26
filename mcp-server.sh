@@ -27,6 +27,11 @@ _MCP_CSRF=""
 # Clash detection cache (populated lazily during tool calls)
 declare -A _CLASH_CACHE
 
+# Delete confirmation state (in-memory, per-server-instance)
+declare -A _DELETE_TOKENS        # token → meetingId
+declare -A _DELETE_TOKEN_EXPIRY  # token → epoch expiry
+_DELETE_TIMESTAMPS=()            # array of epoch timestamps for rate limiting
+
 # Source zoom-cli.sh (loads functions, skips command dispatch via main guard)
 source "${SCRIPT_DIR}/zoom-cli.sh"
 
@@ -305,6 +310,83 @@ detect_clashes() {
   printf '%s' "$clashes"
 }
 
+# ─── Delete helpers ───────────────────────────────────────────────────
+
+# generate_delete_token — generate a UUID token, store it with expiry, return it.
+# Usage: token=$(generate_delete_token "$meeting_id")
+generate_delete_token() {
+  local meeting_id="$1"
+  local token
+  token=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null) || token=""
+  if [[ -z "$token" ]]; then
+    warn "generate_delete_token: failed to generate UUID"
+    return 1
+  fi
+  local expiry
+  expiry=$(( $(date +%s) + 60 ))
+  _DELETE_TOKENS[$token]="$meeting_id"
+  _DELETE_TOKEN_EXPIRY[$token]="$expiry"
+  printf '%s' "$token"
+}
+
+# validate_delete_token — returns 0 if valid, 1 if invalid/expired/wrong meeting.
+# Consumes the token on success (one-time use).
+# Usage: validate_delete_token "$token" "$meeting_id"
+validate_delete_token() {
+  local token="$1" meeting_id="$2"
+
+  # Token must exist
+  if [[ -z "${_DELETE_TOKENS[$token]+_}" ]]; then
+    return 1
+  fi
+
+  # Token must map to the correct meeting
+  if [[ "${_DELETE_TOKENS[$token]}" != "$meeting_id" ]]; then
+    return 1
+  fi
+
+  # Token must not be expired
+  local now expiry
+  now=$(date +%s)
+  expiry="${_DELETE_TOKEN_EXPIRY[$token]:-0}"
+  if (( now > expiry )); then
+    unset '_DELETE_TOKENS[$token]'
+    unset '_DELETE_TOKEN_EXPIRY[$token]'
+    return 1
+  fi
+
+  # Consume the token (one-time use)
+  unset '_DELETE_TOKENS[$token]'
+  unset '_DELETE_TOKEN_EXPIRY[$token]'
+  return 0
+}
+
+# check_delete_rate_limit — prune old timestamps, return 0 if under limit, 1 if over.
+check_delete_rate_limit() {
+  local now
+  now=$(date +%s)
+  local cutoff=$(( now - 60 ))
+
+  # Prune timestamps older than 60 seconds
+  local pruned=()
+  local ts
+  for ts in "${_DELETE_TIMESTAMPS[@]}"; do
+    (( ts > cutoff )) && pruned+=("$ts")
+  done
+  _DELETE_TIMESTAMPS=("${pruned[@]+"${pruned[@]}"}")
+
+  # Check count
+  if (( ${#_DELETE_TIMESTAMPS[@]} >= 6 )); then
+    return 1
+  fi
+  return 0
+}
+
+# record_delete_timestamp — append current epoch to _DELETE_TIMESTAMPS.
+record_delete_timestamp() {
+  _DELETE_TIMESTAMPS+=("$(date +%s)")
+}
+
 # ─── JSON-RPC helpers ─────────────────────────────────────────────────
 
 send_response() {
@@ -426,6 +508,19 @@ handle_tools_list() {
           "required":["topic","date","time"],
           "additionalProperties":false
         }
+      },
+      {
+        "name":"zoom_delete",
+        "description":"Delete a Zoom meeting. Uses two-step confirmation: first call returns meeting details and a confirmation token, second call with the token executes the deletion. Tokens expire after 60 seconds and can only be used once. Rate limited to 6 deletions per minute.",
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "meetingId":{"type":"string","pattern":"^[0-9]+$","description":"Numeric meeting ID to delete."},
+            "confirmToken":{"type":"string","description":"Confirmation token from step 1. Omit for step 1 (get meeting details + token)."}
+          },
+          "required":["meetingId"],
+          "additionalProperties":false
+        }
       }
     ]
   }'
@@ -443,6 +538,7 @@ handle_tools_call() {
     initialize_session) tool_initialize_session "$id" "$line" ;;
     zoom_create)        tool_zoom_create "$id" "$line" ;;
     zoom_update)        tool_zoom_update "$id" "$line" ;;
+    zoom_delete)        tool_zoom_delete "$id" "$line" ;;
     *)
       send_tool_error "$id" "BAD_INPUT" "Unknown tool: ${tool_name:-<empty>}" false
       ;;
@@ -993,6 +1089,123 @@ tool_zoom_update() {
     --argjson clashes "$clashes" \
     '{ok:true, data:{meetingId:$mid, status:"updated", clashes:$clashes}}')
   send_tool_result "$id" "$result"
+}
+
+tool_zoom_delete() {
+  local id="$1" line="$2"
+
+  check_writes_enabled "$id" || return
+
+  # Parse inputs
+  local meeting_id confirm_token
+  meeting_id=$(printf '%s' "$line" | jq -r '.params.arguments.meetingId // ""' 2>/dev/null) || true
+  confirm_token=$(printf '%s' "$line" | jq -r '.params.arguments.confirmToken // ""' 2>/dev/null) || true
+
+  # Validate meetingId
+  if ! validate_meeting_id "$meeting_id"; then
+    send_tool_error "$id" "BAD_INPUT" "meetingId is required and must be numeric." false
+    return
+  fi
+
+  if [[ -z "$confirm_token" ]]; then
+    # ─── Step 1: Get meeting details + generate token ───
+
+    # Existence check via zoom_post /rest/meeting/view
+    local response
+    response=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || true
+
+    if [[ -z "$response" ]]; then
+      send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+      return
+    fi
+
+    if is_auth_expired "$response"; then
+      send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call initialize_session." false
+      return
+    fi
+
+    local status
+    status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+    if [[ "$status" != "true" ]]; then
+      local error_msg
+      error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Meeting not found"' 2>/dev/null) || true
+      send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+      return
+    fi
+
+    # Extract topic for confirmation
+    local topic
+    topic=$(printf '%s' "$response" | jq -r '.result.meeting.topic.value // "Unknown"' 2>/dev/null) || true
+
+    # Generate token
+    local token
+    token=$(generate_delete_token "$meeting_id")
+
+    audit_log "delete_token_issued" "$meeting_id" "$(jq -cn --arg topic "$topic" '{topic:$topic}')"
+
+    # Return confirmation prompt
+    local result
+    result=$(jq -cn \
+      --arg mid "$meeting_id" \
+      --arg topic "$topic" \
+      --arg token "$token" \
+      '{ok:true, data:{action:"confirm_required", meetingId:$mid, topic:$topic, confirmToken:$token, message:"To confirm deletion, call zoom_delete again with this confirmToken. Token expires in 60 seconds."}}')
+    send_tool_result "$id" "$result"
+
+  else
+    # ─── Step 2: Validate token and delete ───
+
+    # Validate token
+    if ! validate_delete_token "$confirm_token" "$meeting_id"; then
+      send_tool_error "$id" "BAD_INPUT" "Invalid, expired, or already-used confirmation token." false
+      return
+    fi
+
+    # Check rate limit
+    if ! check_delete_rate_limit; then
+      send_tool_error "$id" "RATE_LIMITED" "Delete rate limit exceeded (max 6 per minute). Please wait." false
+      return
+    fi
+
+    # Pre-write snapshot
+    local snapshot
+    snapshot=$(zoom_post "/rest/meeting/view" "number=${meeting_id}" 2>/dev/null) || snapshot="{}"
+    audit_log "delete_snapshot" "$meeting_id" "${snapshot:-{}}"
+
+    # Execute delete
+    local response
+    response=$(zoom_post "/meeting/delete" "id=${meeting_id}" "sendMail=false" 2>/dev/null) || true
+
+    if [[ -z "$response" ]]; then
+      audit_log "delete_failure" "$meeting_id" '{"reason":"empty_api_response"}'
+      send_tool_error "$id" "INTERNAL_ERROR" "Empty response from Zoom API." false
+      return
+    fi
+
+    if is_auth_expired "$response"; then
+      send_tool_error "$id" "AUTH_EXPIRED" "Session expired." false
+      return
+    fi
+
+    local status
+    status=$(printf '%s' "$response" | jq -r '.status // false' 2>/dev/null) || true
+    if [[ "$status" != "true" ]]; then
+      local error_msg
+      error_msg=$(printf '%s' "$response" | jq -r '.errorMessage // "Delete failed"' 2>/dev/null) || true
+      audit_log "delete_failure" "$meeting_id" "$(jq -cn --arg reason "$error_msg" '{reason:$reason}')"
+      send_tool_error "$id" "ZOOM_API_ERROR" "$error_msg" false
+      return
+    fi
+
+    # Record timestamp for rate limiting
+    record_delete_timestamp
+
+    audit_log "delete_success" "$meeting_id" '{}'
+
+    local result
+    result=$(jq -cn --arg mid "$meeting_id" '{ok:true, data:{meetingId:$mid, status:"deleted"}}')
+    send_tool_result "$id" "$result"
+  fi
 }
 
 # ─── Main loop ────────────────────────────────────────────────────────

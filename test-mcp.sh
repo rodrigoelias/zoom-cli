@@ -133,14 +133,15 @@ echo -e "\n${CYAN}▸ Protocol: notifications/initialized gets no response${NC}"
 output=$(run_mcp '{"jsonrpc":"2.0","method":"notifications/initialized"}')
 assert_eq "empty output for notification" "" "$output"
 
-echo -e "\n${CYAN}▸ Protocol: tools/list returns 5 tools${NC}"
+echo -e "\n${CYAN}▸ Protocol: tools/list returns 6 tools${NC}"
 output=$(run_mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')
-assert_eq "5 tools returned" "5" "$(echo "$output" | jq '.result.tools | length')"
+assert_eq "6 tools returned" "6" "$(echo "$output" | jq '.result.tools | length')"
 assert_eq "first tool is zoom_list" "zoom_list" "$(echo "$output" | jq -r '.result.tools[0].name')"
 assert_eq "second tool is zoom_view" "zoom_view" "$(echo "$output" | jq -r '.result.tools[1].name')"
 assert_eq "third tool is initialize_session" "initialize_session" "$(echo "$output" | jq -r '.result.tools[2].name')"
 assert_eq "fourth tool is zoom_update" "zoom_update" "$(echo "$output" | jq -r '.result.tools[3].name')"
 assert_eq "fifth tool is zoom_create" "zoom_create" "$(echo "$output" | jq -r '.result.tools[4].name')"
+assert_eq "sixth tool is zoom_delete" "zoom_delete" "$(echo "$output" | jq -r '.result.tools[5].name')"
 # Verify no raw tool
 tool_names=$(echo "$output" | jq -r '.result.tools[].name' | sort)
 assert_not_contains "no raw tool" "raw" "$tool_names"
@@ -235,7 +236,7 @@ assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
 assert_eq "error code ZOOM_API_ERROR" '"ZOOM_API_ERROR"' "$(echo "$tool_text" | jq '.error.code')"
 
 echo -e "\n${CYAN}▸ Error: unknown tool name${NC}"
-output=$(run_mcp '{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"zoom_delete","arguments":{}}}')
+output=$(run_mcp '{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"zoom_nonexistent_tool","arguments":{}}}')
 tool_text=$(echo "$output" | jq -r '.result.content[0].text')
 assert_eq "isError true for unknown tool" "true" "$(echo "$output" | jq '.result.isError')"
 assert_contains "unknown tool error" "Unknown tool" "$tool_text"
