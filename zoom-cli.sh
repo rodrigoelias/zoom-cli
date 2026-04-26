@@ -634,7 +634,7 @@ except Exception as e:
     print('new_id=\"\"')
     print('join_link=\"\"')
     print(f'# Parse error: {e}', file=sys.stderr)
-" 2>&2)"
+" 2>&1)"
 
   if [[ -n "$new_id" && "$new_id" != "None" && "$new_id" != " " ]]; then
     echo ""

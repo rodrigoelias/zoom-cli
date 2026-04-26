@@ -10,6 +10,8 @@
 set -uo pipefail
 # NOTE: no -e (errexit) — a long-running server must not die on individual errors
 
+umask 077  # credential temp files must not be world-readable
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ─── Dependency check ──────────────────────────────────────────────────
@@ -56,9 +58,9 @@ do_reauth() {
 }
 
 # Suppress human-readable output — must not reach stdout
-log()  { echo "$*" >&2; }
-warn() { echo "$*" >&2; }
-err()  { echo "$*" >&2; }
+log()  { echo "[mcp] $*" >&2; }
+warn() { echo "[mcp:warn] $*" >&2; }
+err()  { echo "[mcp:err] $*" >&2; }
 dbg()  { :; }
 
 # Neuterize dangerous functions (defense in depth)
@@ -72,7 +74,7 @@ _shutdown=0
 
 cleanup() {
   _shutdown=1
-  jobs -p 2>/dev/null | xargs -r kill 2>/dev/null
+  jobs -p 2>/dev/null | while read -r pid; do kill "$pid" 2>/dev/null; done
   wait 2>/dev/null
   exit 0
 }
@@ -191,13 +193,14 @@ handle_tools_call() {
 tool_zoom_list() {
   local id="$1" line="$2"
 
-  # Parse arguments
+  # Parse all arguments in one jq call
   local list_type page page_size start_date end_date
-  list_type=$(printf '%s' "$line" | jq -r '.params.arguments.listType // "upcoming"' 2>/dev/null) || true
-  page=$(printf '%s' "$line" | jq -r '.params.arguments.page // 1' 2>/dev/null) || true
-  page_size=$(printf '%s' "$line" | jq -r '.params.arguments.pageSize // 50' 2>/dev/null) || true
-  start_date=$(printf '%s' "$line" | jq -r '.params.arguments.startDate // empty' 2>/dev/null) || true
-  end_date=$(printf '%s' "$line" | jq -r '.params.arguments.endDate // empty' 2>/dev/null) || true
+  read -r list_type page page_size start_date end_date < <(printf '%s' "$line" | jq -r \
+    '[(.params.arguments.listType // "upcoming"),
+      (.params.arguments.page // 1 | tostring),
+      (.params.arguments.pageSize // 50 | tostring),
+      (.params.arguments.startDate // ""),
+      (.params.arguments.endDate // "")] | @tsv' 2>/dev/null) || true
 
   # Build form params
   local params=("listType=${list_type}" "page=${page}" "pageSize=${page_size}" "isShowPAC=false")
@@ -216,7 +219,7 @@ tool_zoom_list() {
 
   # Check auth expiry
   if is_auth_expired "$response"; then
-    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." true
+    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." false
     return
   fi
 
@@ -298,7 +301,7 @@ tool_zoom_view() {
 
   # Check auth expiry
   if is_auth_expired "$response"; then
-    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." true
+    send_tool_error "$id" "AUTH_EXPIRED" "Session expired. Call the initialize_session tool to re-authenticate." false
     return
   fi
 
@@ -408,10 +411,14 @@ main() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ $_shutdown -eq 1 ]] && break
     [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ ${#line} -gt 1048576 ]] && { send_error "null" "-32700" "Request too large"; continue; }
 
     # Extract method and id in one jq call
     local method id
-    read -r method id < <(printf '%s' "$line" | jq -r '[(.method // "null"), ((.id // "null") | tostring)] | @tsv' 2>/dev/null) || true
+    if ! read -r method id < <(printf '%s' "$line" | jq -r '[(.method // "null"), ((.id // "null") | tostring)] | @tsv' 2>/dev/null) || [[ -z "$method" ]]; then
+      send_error "null" "-32700" "Parse error"
+      continue
+    fi
 
     case "$method" in
       initialize)                handle_initialize "$id" ;;
