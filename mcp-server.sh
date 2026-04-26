@@ -112,13 +112,18 @@ audit_log() {
   local ts
   ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
 
+  # Ensure details is valid JSON
+  if ! printf '%s' "$details" | jq empty 2>/dev/null; then
+    details='{}'
+  fi
+
   local entry
   entry=$(jq -cn \
     --arg ts        "$ts" \
     --arg action    "$action" \
     --arg mid       "$meeting_id" \
     --argjson det   "$details" \
-    '{timestamp:$ts, action:$action, meetingId:(if $mid=="" then null else $mid end), details:$det}')
+    '{timestamp:$ts, action:$action, meetingId:(if $mid=="" then null else $mid end), details:$det}') || return
 
   # Rotate if file exceeds 10 000 lines
   if [[ -f "$log_file" ]]; then
@@ -667,18 +672,15 @@ tool_zoom_create() {
   # 1. Check writes enabled
   check_writes_enabled "$id" || return
 
-  # 2. Parse all inputs in a single jq call
+  # 2. Parse each input individually to avoid IFS/tsv empty-field collapsing issues
   local topic date time ampm duration timezone invitees_csv
-  read -r topic date time ampm duration timezone invitees_csv < <(printf '%s' "$line" | jq -r \
-    '[
-      (.params.arguments.topic // ""),
-      (.params.arguments.date // ""),
-      (.params.arguments.time // ""),
-      (.params.arguments.ampm // "PM"),
-      (.params.arguments.duration // 60 | tostring),
-      (.params.arguments.timezone // "Europe/London"),
-      ((.params.arguments.invitees // []) | join(","))
-    ] | @tsv' 2>/dev/null) || true
+  topic=$(printf '%s' "$line" | jq -r '.params.arguments.topic // ""' 2>/dev/null) || true
+  date=$(printf '%s' "$line" | jq -r '.params.arguments.date // ""' 2>/dev/null) || true
+  time=$(printf '%s' "$line" | jq -r '.params.arguments.time // ""' 2>/dev/null) || true
+  ampm=$(printf '%s' "$line" | jq -r '.params.arguments.ampm // "PM"' 2>/dev/null) || true
+  duration=$(printf '%s' "$line" | jq -r '.params.arguments.duration // 60 | tostring' 2>/dev/null) || true
+  timezone=$(printf '%s' "$line" | jq -r '.params.arguments.timezone // "Europe/London"' 2>/dev/null) || true
+  invitees_csv=$(printf '%s' "$line" | jq -r '(.params.arguments.invitees // []) | join(",")' 2>/dev/null) || true
 
   # 3. Validate required fields
   if ! validate_topic "$topic"; then
@@ -829,18 +831,18 @@ tool_zoom_update() {
   # 1. Check writes enabled
   check_writes_enabled "$id" || return
 
-  # 2. Parse all inputs in a single jq call
+  # 2. Parse each input individually to avoid IFS/tsv empty-field collapsing issues
   local meeting_id topic date time ampm duration_hr duration_min
-  read -r meeting_id topic date time ampm duration_hr duration_min < <(printf '%s' "$line" | jq -r \
-    '[
-      (.params.arguments.meetingId // ""),
-      (.params.arguments.topic // ""),
-      (.params.arguments.date // ""),
-      (.params.arguments.time // ""),
-      (.params.arguments.ampm // ""),
-      (.params.arguments.duration_hr // "" | tostring),
-      (.params.arguments.duration_min // "" | tostring)
-    ] | @tsv' 2>/dev/null) || true
+  meeting_id=$(printf '%s' "$line" | jq -r '.params.arguments.meetingId // ""' 2>/dev/null) || true
+  topic=$(printf '%s' "$line" | jq -r '.params.arguments.topic // ""' 2>/dev/null) || true
+  date=$(printf '%s' "$line" | jq -r '.params.arguments.date // ""' 2>/dev/null) || true
+  time=$(printf '%s' "$line" | jq -r '.params.arguments.time // ""' 2>/dev/null) || true
+  ampm=$(printf '%s' "$line" | jq -r '.params.arguments.ampm // ""' 2>/dev/null) || true
+  duration_hr=$(printf '%s' "$line" | jq -r '.params.arguments.duration_hr // "" | tostring' 2>/dev/null) || true
+  duration_min=$(printf '%s' "$line" | jq -r '.params.arguments.duration_min // "" | tostring' 2>/dev/null) || true
+  # Normalise jq "null" strings to empty
+  [[ "$duration_hr"  == "null" ]] && duration_hr=""
+  [[ "$duration_min" == "null" ]] && duration_min=""
 
   # 3. Validate meetingId (required)
   if ! validate_meeting_id "$meeting_id"; then

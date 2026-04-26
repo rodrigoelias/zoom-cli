@@ -133,17 +133,17 @@ echo -e "\n${CYAN}▸ Protocol: notifications/initialized gets no response${NC}"
 output=$(run_mcp '{"jsonrpc":"2.0","method":"notifications/initialized"}')
 assert_eq "empty output for notification" "" "$output"
 
-echo -e "\n${CYAN}▸ Protocol: tools/list returns 3 tools${NC}"
+echo -e "\n${CYAN}▸ Protocol: tools/list returns 5 tools${NC}"
 output=$(run_mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')
-assert_eq "3 tools returned" "3" "$(echo "$output" | jq '.result.tools | length')"
+assert_eq "5 tools returned" "5" "$(echo "$output" | jq '.result.tools | length')"
 assert_eq "first tool is zoom_list" "zoom_list" "$(echo "$output" | jq -r '.result.tools[0].name')"
 assert_eq "second tool is zoom_view" "zoom_view" "$(echo "$output" | jq -r '.result.tools[1].name')"
 assert_eq "third tool is initialize_session" "initialize_session" "$(echo "$output" | jq -r '.result.tools[2].name')"
-# Verify no raw/create/delete/update tools
+assert_eq "fourth tool is zoom_update" "zoom_update" "$(echo "$output" | jq -r '.result.tools[3].name')"
+assert_eq "fifth tool is zoom_create" "zoom_create" "$(echo "$output" | jq -r '.result.tools[4].name')"
+# Verify no raw tool
 tool_names=$(echo "$output" | jq -r '.result.tools[].name' | sort)
 assert_not_contains "no raw tool" "raw" "$tool_names"
-assert_not_contains "no create tool" "create" "$tool_names"
-assert_not_contains "no delete tool" "delete" "$tool_names"
 
 echo -e "\n${CYAN}▸ Protocol: unknown method returns -32601${NC}"
 output=$(run_mcp '{"jsonrpc":"2.0","id":3,"method":"unknown/method","params":{}}')
@@ -332,6 +332,122 @@ printf '%s\n' '{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"
 # The mock node writes .raw_cookies relative to the script dir — check it was cleaned
 # We can't easily check the actual script dir from here, but we can verify the mock was called
 assert_eq "mock node exists" "true" "$([[ -x "${MOCK_BIN}/node" ]] && echo true || echo false)"
+
+# ─── Functional Tests: zoom_create ──────────────────────────────────
+
+echo -e "\n${CYAN}▸ Functional: zoom_create success${NC}"
+setup_mock_curl '{"status":true,"errorCode":0,"result":{"mn":"94244974137","meetingNumber":"94244974137","joinLink":"https://skyscanner.zoom.us/j/94244974137"}}'
+output=$(run_mcp '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test Meeting","date":"04/30/2026","time":"2:00","ampm":"PM","duration":60}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError false" "false" "$(echo "$output" | jq '.result.isError')"
+assert_eq "ok true" "true" "$(echo "$tool_text" | jq '.ok')"
+assert_eq "meetingId returned" '"94244974137"' "$(echo "$tool_text" | jq '.data.meetingId')"
+assert_contains "joinUrl present" "zoom.us/j/94244974137" "$tool_text"
+assert_eq "topic echoed" '"Test Meeting"' "$(echo "$tool_text" | jq '.data.topic')"
+
+echo -e "\n${CYAN}▸ Error: zoom_create missing topic${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"","date":"04/30/2026","time":"2:00"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_create missing date${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test","date":"","time":"2:00"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_create invalid date format${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test","date":"2026-04-30","time":"2:00"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_create invalid time format${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test","date":"04/30/2026","time":"14:00:00"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_create auth expired${NC}"
+setup_mock_curl '{"status":false,"errorCode":201,"errorMessage":"User not login."}'
+output=$(run_mcp '{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test Meeting","date":"04/30/2026","time":"2:00","ampm":"PM"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code AUTH_EXPIRED" '"AUTH_EXPIRED"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_create API error${NC}"
+setup_mock_curl '{"status":false,"errorCode":400,"errorMessage":"Bad request"}'
+output=$(run_mcp '{"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test Meeting","date":"04/30/2026","time":"2:00","ampm":"PM"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code ZOOM_API_ERROR" '"ZOOM_API_ERROR"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Security: zoom_create writes disabled${NC}"
+output=$(printf '%s\n' '{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test Meeting","date":"04/30/2026","time":"2:00","ampm":"PM"}}}' | \
+  ZOOM_CLI_WRITES_ENABLED=false PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null)
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code WRITES_DISABLED" '"WRITES_DISABLED"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_create invalid invitee email${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":108,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Test","date":"04/30/2026","time":"2:00","invitees":["not-an-email"]}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Audit: zoom_create audit logged${NC}"
+setup_mock_curl '{"status":true,"errorCode":0,"result":{"mn":"94244974137","meetingNumber":"94244974137","joinLink":"https://skyscanner.zoom.us/j/94244974137"}}'
+# Clean up any prior audit log
+rm -f "${SCRIPT_DIR}/.mcp-audit.log"
+run_mcp '{"jsonrpc":"2.0","id":109,"method":"tools/call","params":{"name":"zoom_create","arguments":{"topic":"Audit Test","date":"04/30/2026","time":"2:00","ampm":"PM"}}}' >/dev/null
+assert_eq "audit log file created" "true" "$([[ -f "${SCRIPT_DIR}/.mcp-audit.log" ]] && echo true || echo false)"
+assert_contains "audit log has create_attempt" "create_attempt" "$(cat "${SCRIPT_DIR}/.mcp-audit.log" 2>/dev/null)"
+rm -f "${SCRIPT_DIR}/.mcp-audit.log"
+
+# ─── Functional Tests: zoom_update ──────────────────────────────────
+
+echo -e "\n${CYAN}▸ Functional: zoom_update success${NC}"
+setup_mock_curl '{"status":true,"errorCode":0,"result":{}}'
+output=$(run_mcp '{"jsonrpc":"2.0","id":110,"method":"tools/call","params":{"name":"zoom_update","arguments":{"meetingId":"94244974137","topic":"Updated Topic"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError false" "false" "$(echo "$output" | jq '.result.isError')"
+assert_eq "ok true" "true" "$(echo "$tool_text" | jq '.ok')"
+assert_eq "status updated" '"updated"' "$(echo "$tool_text" | jq '.data.status')"
+assert_eq "meetingId echoed" '"94244974137"' "$(echo "$tool_text" | jq '.data.meetingId')"
+
+echo -e "\n${CYAN}▸ Error: zoom_update missing meetingId${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":111,"method":"tools/call","params":{"name":"zoom_update","arguments":{"topic":"Updated Topic"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_update no update fields${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":112,"method":"tools/call","params":{"name":"zoom_update","arguments":{"meetingId":"94244974137"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+assert_contains "at least one field message" "At least one field" "$tool_text"
+
+echo -e "\n${CYAN}▸ Error: zoom_update invalid date format${NC}"
+output=$(run_mcp '{"jsonrpc":"2.0","id":113,"method":"tools/call","params":{"name":"zoom_update","arguments":{"meetingId":"123","date":"bad-date"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code BAD_INPUT" '"BAD_INPUT"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Error: zoom_update auth expired${NC}"
+setup_mock_curl '{"status":false,"errorCode":201,"errorMessage":"User not login."}'
+output=$(run_mcp '{"jsonrpc":"2.0","id":114,"method":"tools/call","params":{"name":"zoom_update","arguments":{"meetingId":"94244974137","topic":"New Topic"}}}')
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code AUTH_EXPIRED" '"AUTH_EXPIRED"' "$(echo "$tool_text" | jq '.error.code')"
+
+echo -e "\n${CYAN}▸ Security: zoom_update writes disabled${NC}"
+output=$(printf '%s\n' '{"jsonrpc":"2.0","id":115,"method":"tools/call","params":{"name":"zoom_update","arguments":{"meetingId":"94244974137","topic":"New Topic"}}}' | \
+  ZOOM_CLI_WRITES_ENABLED=false PATH="${MOCK_BIN}:${PATH}" bash "$MCP_SERVER" 2>/dev/null)
+tool_text=$(echo "$output" | jq -r '.result.content[0].text')
+assert_eq "isError true" "true" "$(echo "$output" | jq '.result.isError')"
+assert_eq "error code WRITES_DISABLED" '"WRITES_DISABLED"' "$(echo "$tool_text" | jq '.error.code')"
 
 # ─── Summary ─────────────────────────────────────────────────────────
 
