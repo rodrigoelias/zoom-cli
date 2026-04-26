@@ -429,105 +429,41 @@ print()
 "
 }
 
-# ─── create ───────────────────────────────────────────────────────────
+# ─── build_create_payload ─────────────────────────────────────────────
+# Reads JSON args from stdin, loads meeting-template.json, prints payload.
+# Input JSON keys: topic, agenda, date, time, ampm, duration, timezone,
+#   invitees (comma-separated string), recurring (bool), recurrence_type,
+#   recurrence_interval, recurrence_end, recurrence_days
 
-cmd_create() {
-  local topic="My Meeting"
-  local when="" time_val="" ampm="PM" duration="60"
-  local timezone="Europe/London"
-  local agenda=""
-  local recurring=false
-  local recurrence_type="" recurrence_interval="1" recurrence_end=""
-  local recurrence_days=""
-  local invitees=""
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --topic|-t)              topic="$2"; shift 2;;
-      --agenda|--desc)         agenda="$2"; shift 2;;
-      --date|-d)               when="$2"; shift 2;;
-      --time)                  time_val="$2"; shift 2;;
-      --ampm)                  ampm="$2"; shift 2;;
-      --duration)              duration="$2"; shift 2;;
-      --timezone|-tz)          timezone="$2"; shift 2;;
-      --recurring|-r)          recurring=true; shift;;
-      --recurrence-type)       recurrence_type="$2"; shift 2;;  # DAILY, WEEKLY, MONTHLY
-      --recurrence-interval)   recurrence_interval="$2"; shift 2;;
-      --recurrence-end)        recurrence_end="$2"; shift 2;;
-      --recurrence-days)       recurrence_days="$2"; shift 2;;  # comma-sep: MO,TU,WE,TH,FR,SA,SU
-      --invite|-i)             invitees="${invitees:+${invitees},}$2"; shift 2;;
-      --help|-h)
-        cat << 'EOF'
-Usage: zoom-cli.sh create [options]
-
-Options:
-  --topic, -t            Meeting topic (default: "My Meeting")
-  --agenda, --desc       Meeting description/agenda
-  --date, -d             Start date MM/DD/YYYY (default: today)
-  --time                 Time H:MM (default: next round hour)
-  --ampm                 AM or PM (default: PM)
-  --duration             Duration in minutes (default: 60)
-  --timezone, -tz        Timezone (default: Europe/London)
-  --invite, -i           Invitee email (repeat for multiple)
-  --recurring, -r        Enable recurrence
-  --recurrence-type      DAILY, WEEKLY, or MONTHLY
-  --recurrence-interval  Every N periods (default: 1)
-  --recurrence-days      Day(s) of week: MO,TU,WE,TH,FR,SA,SU
-  --recurrence-end       End date MM/DD/YYYY
-
-Examples:
-  ./zoom-cli.sh create -t "Standup" -d 03/28/2026 --time 9:00 --ampm AM --duration 30
-  ./zoom-cli.sh create -t "Weekly" --recurring --recurrence-type WEEKLY --recurrence-days SA --time 10:00 --ampm AM
-  ./zoom-cli.sh create -t "Sync" -i alice@example.com -i bob@example.com
-EOF
-        return 0;;
-      *) err "Unknown option: $1"; exit 1;;
-    esac
-  done
-
-  [[ -z "$when" ]] && when=$(date '+%m/%d/%Y')
-  if [[ -z "$time_val" ]]; then
-    local h=$(( $(date '+%-H') + 1 ))
-    if   (( h > 12 )); then time_val="$(( h - 12 )):00"; ampm="PM"
-    elif (( h == 12 )); then time_val="12:00"; ampm="PM"
-    else time_val="${h}:00"; ampm="AM"; fi
-  fi
-
-  log "Creating meeting..."
-  echo -e "  Topic:    ${GREEN}${topic}${NC}"
-  echo -e "  When:     ${when} ${time_val} ${ampm}"
-  echo -e "  Duration: ${duration} min"
-  echo -e "  Timezone: ${timezone}"
-  [[ -n "$invitees" ]] && echo -e "  Invitees: ${CYAN}${invitees}${NC}"
-  [[ "$recurring" == true ]] && echo -e "  Recurring: ${YELLOW}${recurrence_type:-DAILY} every ${recurrence_interval}${NC}"
-
+build_create_payload() {
   local template_file="${SCRIPT_DIR}/meeting-template.json"
   if [[ ! -f "$template_file" ]]; then
     err "Missing meeting-template.json"
-    exit 1
+    return 1
   fi
 
-  # Build JSON payload: load template, override with user values
-  local json_body
-  json_body=$(python3 -c "
-import json, sys, copy
+  python3 -c "
+import json, sys
 
-with open('${template_file}') as f:
+template_file = sys.argv[1]
+args = json.load(sys.stdin)
+
+topic         = args.get('topic', 'My Meeting')
+agenda        = args.get('agenda', '')
+when          = args.get('date', '')
+time_val      = args.get('time', '')
+ampm          = args.get('ampm', 'PM')
+duration      = int(args.get('duration', 60))
+timezone      = args.get('timezone', 'Europe/London')
+recurring     = args.get('recurring', False)
+rec_type      = args.get('recurrence_type') or 'DAILY'
+rec_interval  = args.get('recurrence_interval') or '1'
+rec_end       = args.get('recurrence_end', '')
+rec_days      = args.get('recurrence_days', '')
+invitee_str   = args.get('invitees', '')
+
+with open(template_file) as f:
     p = json.load(f)
-
-topic      = '''${topic}'''
-agenda     = '''${agenda}'''
-when       = '${when}'
-time_val   = '${time_val}'
-ampm       = '${ampm}'
-duration   = int('${duration}')
-timezone   = '${timezone}'
-recurring  = '${recurring}' == 'true'
-rec_type   = '${recurrence_type}' or 'DAILY'
-rec_interval = '${recurrence_interval}' or '1'
-rec_end    = '${recurrence_end}'
-rec_days   = '${recurrence_days}'
-invitee_str = '${invitees}'
 
 # Override basic fields
 p['topic']['value'] = topic
@@ -604,7 +540,103 @@ else:
     pass
 
 print(json.dumps(p))
-") || { err "Failed to build JSON payload"; return 1; }
+" "$template_file" || { err "Failed to build JSON payload"; return 1; }
+}
+
+# ─── create ───────────────────────────────────────────────────────────
+
+cmd_create() {
+  local topic="My Meeting"
+  local when="" time_val="" ampm="PM" duration="60"
+  local timezone="Europe/London"
+  local agenda=""
+  local recurring=false
+  local recurrence_type="" recurrence_interval="1" recurrence_end=""
+  local recurrence_days=""
+  local invitees=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --topic|-t)              topic="$2"; shift 2;;
+      --agenda|--desc)         agenda="$2"; shift 2;;
+      --date|-d)               when="$2"; shift 2;;
+      --time)                  time_val="$2"; shift 2;;
+      --ampm)                  ampm="$2"; shift 2;;
+      --duration)              duration="$2"; shift 2;;
+      --timezone|-tz)          timezone="$2"; shift 2;;
+      --recurring|-r)          recurring=true; shift;;
+      --recurrence-type)       recurrence_type="$2"; shift 2;;  # DAILY, WEEKLY, MONTHLY
+      --recurrence-interval)   recurrence_interval="$2"; shift 2;;
+      --recurrence-end)        recurrence_end="$2"; shift 2;;
+      --recurrence-days)       recurrence_days="$2"; shift 2;;  # comma-sep: MO,TU,WE,TH,FR,SA,SU
+      --invite|-i)             invitees="${invitees:+${invitees},}$2"; shift 2;;
+      --help|-h)
+        cat << 'EOF'
+Usage: zoom-cli.sh create [options]
+
+Options:
+  --topic, -t            Meeting topic (default: "My Meeting")
+  --agenda, --desc       Meeting description/agenda
+  --date, -d             Start date MM/DD/YYYY (default: today)
+  --time                 Time H:MM (default: next round hour)
+  --ampm                 AM or PM (default: PM)
+  --duration             Duration in minutes (default: 60)
+  --timezone, -tz        Timezone (default: Europe/London)
+  --invite, -i           Invitee email (repeat for multiple)
+  --recurring, -r        Enable recurrence
+  --recurrence-type      DAILY, WEEKLY, or MONTHLY
+  --recurrence-interval  Every N periods (default: 1)
+  --recurrence-days      Day(s) of week: MO,TU,WE,TH,FR,SA,SU
+  --recurrence-end       End date MM/DD/YYYY
+
+Examples:
+  ./zoom-cli.sh create -t "Standup" -d 03/28/2026 --time 9:00 --ampm AM --duration 30
+  ./zoom-cli.sh create -t "Weekly" --recurring --recurrence-type WEEKLY --recurrence-days SA --time 10:00 --ampm AM
+  ./zoom-cli.sh create -t "Sync" -i alice@example.com -i bob@example.com
+EOF
+        return 0;;
+      *) err "Unknown option: $1"; exit 1;;
+    esac
+  done
+
+  [[ -z "$when" ]] && when=$(date '+%m/%d/%Y')
+  if [[ -z "$time_val" ]]; then
+    local h=$(( $(date '+%-H') + 1 ))
+    if   (( h > 12 )); then time_val="$(( h - 12 )):00"; ampm="PM"
+    elif (( h == 12 )); then time_val="12:00"; ampm="PM"
+    else time_val="${h}:00"; ampm="AM"; fi
+  fi
+
+  log "Creating meeting..."
+  echo -e "  Topic:    ${GREEN}${topic}${NC}"
+  echo -e "  When:     ${when} ${time_val} ${ampm}"
+  echo -e "  Duration: ${duration} min"
+  echo -e "  Timezone: ${timezone}"
+  [[ -n "$invitees" ]] && echo -e "  Invitees: ${CYAN}${invitees}${NC}"
+  [[ "$recurring" == true ]] && echo -e "  Recurring: ${YELLOW}${recurrence_type:-DAILY} every ${recurrence_interval}${NC}"
+
+  # Build JSON payload: pipe args as JSON to build_create_payload
+  local json_body
+  json_body=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'topic':               sys.argv[1],
+    'agenda':              sys.argv[2],
+    'date':                sys.argv[3],
+    'time':                sys.argv[4],
+    'ampm':                sys.argv[5],
+    'duration':            int(sys.argv[6]),
+    'timezone':            sys.argv[7],
+    'recurring':           sys.argv[8] == 'true',
+    'recurrence_type':     sys.argv[9],
+    'recurrence_interval': sys.argv[10],
+    'recurrence_end':      sys.argv[11],
+    'recurrence_days':     sys.argv[12],
+    'invitees':            sys.argv[13],
+}))
+" "$topic" "$agenda" "$when" "$time_val" "$ampm" "$duration" "$timezone" \
+  "$recurring" "$recurrence_type" "$recurrence_interval" "$recurrence_end" "$recurrence_days" \
+  "$invitees" | build_create_payload) || { err "Failed to build JSON payload"; return 1; }
 
   dbg "create payload: ${json_body:0:500}"
 
