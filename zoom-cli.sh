@@ -12,6 +12,10 @@
 
 set -euo pipefail
 
+# Re-entrancy guard: prevent double-sourcing
+[[ -n "${_ZOOM_CLI_LOADED:-}" ]] && return 0 2>/dev/null || true
+_ZOOM_CLI_LOADED=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RAW_COOKIE_FILE="${SCRIPT_DIR}/.raw_cookies"
 CSRF_FILE="${SCRIPT_DIR}/.csrf_token"
@@ -30,7 +34,7 @@ dbg()  { [[ "${ZOOM_DEBUG:-0}" == "1" ]] && echo -e "${YELLOW}[dbg]${NC} $*" >&2
 get_cookies() {
   if [[ ! -f "$RAW_COOKIE_FILE" ]]; then
     err "No cookies. Run:  $0 set-cookies \"<cookie_string>\"  or  $0 import-cookies"
-    exit 1
+    return 1
   fi
   cat "$RAW_COOKIE_FILE"
 }
@@ -40,13 +44,13 @@ cmd_import_cookies() {
   local src="${1:-${SCRIPT_DIR}/cookies.txt}"
   if [[ ! -f "$src" ]]; then
     err "Cookie file not found: ${src}"
-    exit 1
+    return 1
   fi
   local raw
   raw=$(awk '!/^#/ && NF >= 7 { printf "%s=%s; ", $6, $7 }' "$src" | sed 's/; $//')
   if [[ -z "$raw" ]]; then
     err "No cookies parsed from ${src}"
-    exit 1
+    return 1
   fi
   printf '%s' "$raw" > "$RAW_COOKIE_FILE"
   local count
@@ -83,7 +87,7 @@ cmd_refresh_csrf() {
     -H "Referer: ${ZOOM_BASE}/meeting" \
     "${ZOOM_BASE}/csrf_js" 2>&1) || {
       err "curl failed (exit $?). Check your network / VPN."
-      exit 1
+      return 1
     }
 
   dbg "csrf_js response: ${response}"
@@ -110,7 +114,7 @@ cmd_refresh_csrf() {
   else
     err "Could not extract CSRF token."
     err "Raw response: ${response:0:500}"
-    exit 1
+    return 1
   fi
 }
 
@@ -119,7 +123,7 @@ get_csrf() {
     cat "$CSRF_FILE"
   else
     err "No CSRF token. Run:  $0 refresh-csrf"
-    exit 1
+    return 1
   fi
 }
 
@@ -630,7 +634,7 @@ except Exception as e:
     print('new_id=\"\"')
     print('join_link=\"\"')
     print(f'# Parse error: {e}', file=sys.stderr)
-" 2>&2)"
+" 2>&1)"
 
   if [[ -n "$new_id" && "$new_id" != "None" && "$new_id" != " " ]]; then
     echo ""
@@ -719,6 +723,9 @@ cmd_raw() {
 
 # ─── main ─────────────────────────────────────────────────────────────
 
+# Main guard: skip dispatch when sourced by another script
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+
 case "${1:-help}" in
   set-cookies)
     [[ -z "${2:-}" ]] && { err "Usage: $0 set-cookies \"<cookie_string>\""; exit 1; }
@@ -781,3 +788,5 @@ case "${1:-help}" in
     ;;
   *) err "Unknown: $1 — try '$0 help'"; exit 1 ;;
 esac
+
+fi  # end main guard
